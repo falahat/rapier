@@ -63,7 +63,9 @@ impl ColliderChanges {
         //       bottleneck at some point in the future (which is very unlikely)
         //       we could do a special-case for dominance-only change (so that
         //       we only update the relative_dominance of the pre-existing contact.
-        self.bits() > 2
+        !self
+            .difference(Self::IN_MODIFIED_SET | Self::LOCAL_MASS_PROPERTIES)
+            .is_empty()
     }
 }
 
