@@ -738,3 +738,33 @@ fn contact_force_events_follow_runtime_active_events_flips() {
     }
     assert_eq!(events.0.load(Ordering::Relaxed), after_enable);
 }
+
+/// A collision pass between steps (`PhysicsWorld::detect_collisions`) mirrors the contact pairs
+/// it removes in the persistent islands, as a step does. Without that, a touching pair moved
+/// into a removed pair's slot lost its island link, and the next step's link validation failed:
+/// "touching pair not linked in the persistent islands".
+#[test]
+fn collision_pass_between_steps_keeps_island_links() {
+    use crate::math::Real;
+    use crate::pipeline::PhysicsWorld;
+
+    for removed in 0..4 {
+        let mut world = PhysicsWorld::default();
+        #[cfg(feature = "dim2")]
+        let ground = ColliderBuilder::cuboid(10.0, 0.5);
+        #[cfg(feature = "dim3")]
+        let ground = ColliderBuilder::cuboid(10.0, 0.5, 10.0);
+        world.insert_collider(ground, None);
+        let balls: alloc::vec::Vec<_> = (0..4)
+            .map(|i| {
+                let at = Vector::X * (2.0 * i as Real - 3.0) + Vector::Y * 0.99;
+                let body = world.insert_body(RigidBodyBuilder::dynamic().translation(at));
+                world.insert_collider(ColliderBuilder::ball(0.5), Some(body))
+            })
+            .collect();
+        world.step();
+        world.remove_collider(balls[removed]);
+        world.detect_collisions(&(), &());
+        world.step();
+    }
+}

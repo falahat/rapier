@@ -89,10 +89,11 @@ impl CollisionPipeline {
             &mut self.broad_phase_events,
         );
 
-        // Update narrow-phase.
+        // Update narrow-phase. The persistent islands mirror every contact-graph edit, so they
+        // see this pass's removals and swap-moves exactly as a physics step's.
         if handle_user_changes {
             narrow_phase.handle_user_changes(
-                None,
+                Some(&mut *islands),
                 modified_colliders,
                 removed_colliders,
                 colliders,
@@ -101,7 +102,13 @@ impl CollisionPipeline {
             );
         }
 
-        narrow_phase.register_pairs(None, colliders, bodies, &self.broad_phase_events, events);
+        narrow_phase.register_pairs(
+            Some(&mut *islands),
+            colliders,
+            bodies,
+            &self.broad_phase_events,
+            events,
+        );
         narrow_phase.compute_contacts(
             prediction_distance,
             0.0,
