@@ -86,15 +86,18 @@ impl NarrowPhase {
         contact_id_remap: &mut HashMap<ColliderHandle, ColliderGraphIndex>,
         events: &dyn EventHandler,
     ) {
-        // Wake up every body in contact with the deleted collider and generate Stopped collision events.
+        // Wake up every body touching the deleted collider and generate Stopped collision events.
+        // A body merely near it (a pair with no active contact) loses no support by its removal.
         if let Some(islands) = islands.as_deref_mut() {
             for (a, b, pair) in self.contact_graph.interactions_with(contact_graph_id) {
-                if let Some(parent) = colliders.get(a).and_then(|c| c.parent.as_ref()) {
-                    islands.wake_up(bodies, parent.handle, true)
-                }
+                if pair.has_any_active_contact() {
+                    if let Some(parent) = colliders.get(a).and_then(|c| c.parent.as_ref()) {
+                        islands.wake_up(bodies, parent.handle, true)
+                    }
 
-                if let Some(parent) = colliders.get(b).and_then(|c| c.parent.as_ref()) {
-                    islands.wake_up(bodies, parent.handle, true)
+                    if let Some(parent) = colliders.get(b).and_then(|c| c.parent.as_ref()) {
+                        islands.wake_up(bodies, parent.handle, true)
+                    }
                 }
 
                 if pair
