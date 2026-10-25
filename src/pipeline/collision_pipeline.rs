@@ -187,7 +187,7 @@ impl CollisionPipeline {
             &modified_colliders[..],
         );
         super::user_changes::handle_user_changes_to_rigid_bodies(
-            None,
+            Some(&mut *islands),
             bodies,
             colliders,
             &mut ImpulseJointSet::new(),
