@@ -91,6 +91,7 @@ impl NarrowPhase {
         if let Some(islands) = islands.as_deref_mut() {
             for (a, b, pair) in self.contact_graph.interactions_with(contact_graph_id) {
                 if pair.has_any_active_contact() {
+                    log::debug!(target: "c201_sleep", "REMOVED_ACTIVE_CONTACT a={a:?} b={b:?} a_data={:?} b_data={:?} a_parent={:?} b_parent={:?}", colliders.get(a).map(|co| co.user_data), colliders.get(b).map(|co| co.user_data), colliders.get(a).and_then(|co| co.parent.map(|p| p.handle)), colliders.get(b).and_then(|co| co.parent.map(|p| p.handle)));
                     if let Some(parent) = colliders.get(a).and_then(|c| c.parent.as_ref()) {
                         islands.wake_up(bodies, parent.handle, true)
                     }
@@ -230,6 +231,7 @@ impl NarrowPhase {
                     }
                 }
 
+                log::debug!(target: "c201_sleep", "MODIFIED_COLLIDER collider={handle:?} data={} parent={:?} flags={:?} groups={:?} needs_narrow={}", co.user_data, co.parent.map(|p| p.handle), co.changes, co.collision_groups(), co.changes.needs_narrow_phase_update());
                 if !co.changes.needs_narrow_phase_update() {
                     // No flag relevant to the narrow-phase is enabled for this collider.
                     continue;
@@ -260,6 +262,7 @@ impl NarrowPhase {
                                 .and_then(|co| co.parent.as_ref());
 
                             if let Some(other_parent) = other_parent {
+                                log::debug!(target: "c201_sleep", "MODIFIED_CONTACT_PEER collider={handle:?} peer={other_handle:?} peer_parent={:?} peer_data={:?} flags={:?}", other_parent.handle, colliders.get(other_handle).map(|co| co.user_data), co.changes);
                                 islands.wake_up(bodies, other_parent.handle, true);
                             }
                         }

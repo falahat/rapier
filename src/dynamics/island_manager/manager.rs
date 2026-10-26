@@ -358,6 +358,7 @@ impl IslandManager {
     /// Updates a body's sleep-eligibility timer from its current velocities
     /// and last-step displacement.
     pub(crate) fn update_body_energy(
+        trace_body: RigidBodyHandle,
         rb: &mut RigidBody,
         soft_bodies: &SoftBodySet,
         dt: Real,
@@ -376,6 +377,7 @@ impl IslandManager {
         };
         let sq_angvel = rb.vels.angvel.gdot(rb.vels.angvel);
         let pose = rb.pos.position;
+        log::debug!(target: "c201_sleep", "BODY_ENERGY body={trace_body:?} colliders={:?} local_com={:?} max_extent={:?} linvel={:?} angvel={:?} pose={pose:?} activation={:?}", rb.colliders.0, rb.mprops.local_mprops.local_com, rb.mprops.max_extent(), rb.vels.linvel, rb.vels.angvel, rb.activation);
         rb.activation.update_energy(
             rb.body_type,
             length_unit,
@@ -384,6 +386,7 @@ impl IslandManager {
             rb.mprops.max_extent(),
             &pose,
             dt,
+            Some(trace_body),
         );
     }
 

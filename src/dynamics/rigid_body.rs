@@ -924,12 +924,16 @@ impl RigidBody {
     ///   If `false`, it might sleep again immediately if conditions are met.
     ///
     /// Use after manually moving a sleeping body or to keep it active temporarily.
+    #[track_caller]
     pub fn wake_up(&mut self, strong: bool) {
+        let caller = core::panic::Location::caller();
+        let before = self.activation;
         if self.activation.sleeping {
             self.changes.insert(RigidBodyChanges::SLEEP);
         }
 
         self.activation.wake_up(strong);
+        log::debug!(target: "c201_sleep", "DIRECT_WAKE strong={strong} colliders={:?} ids={:?} pose={:?} before={before:?} after={:?} caller={}:{}:{}", self.colliders.0, self.ids, self.pos.position, self.activation, caller.file(), caller.line(), caller.column());
     }
 
     /// Is this rigid body sleeping?

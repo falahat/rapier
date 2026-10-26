@@ -4,7 +4,7 @@ use crate::alloc_prelude::*;
 use crate::control::PdErrors;
 #[cfg(doc)]
 use crate::control::PidController;
-use crate::dynamics::MassProperties;
+use crate::dynamics::{MassProperties, RigidBodyHandle};
 use crate::geometry::{
     ColliderChanges, ColliderHandle, ColliderMassProps, ColliderParent, ColliderPosition,
     ColliderSet, ColliderShape, ModifiedColliders,
@@ -1447,12 +1447,17 @@ impl RigidBodyActivation {
         max_extent: Real,
         pose: &Pose,
         dt: Real,
+        trace_body: Option<RigidBodyHandle>,
     ) {
+        let timer_before = self.time_since_can_sleep;
+        let previous_pose = self.sleep_prev_pose;
+        let mut pose_test = None;
         // A manual `RigidBody::sleep()` pins sleep eligibility until something wakes the
         // body: the velocity/drift gates must not cancel it (a teleport right before
         // sleeping trips the drift gate, keeping the body simulated while flagged asleep).
         if self.sleeping {
             self.time_since_can_sleep = self.time_until_sleep;
+            log::debug!(target: "c201_sleep", "ELIGIBILITY_PINNED body={trace_body:?} timer_before={timer_before:?} timer_after={:?}", self.time_since_can_sleep);
             return;
         }
 
@@ -1484,6 +1489,7 @@ impl RigidBodyActivation {
                 };
 
                 let drift = crate::geometry::relative_pose_drift(&prev_pose, pose, max_extent);
+                pose_test = Some((angular_ok, drift));
                 angular_ok && drift * 0.5 < linear_threshold * dt
             }
             RigidBodyType::KinematicPositionBased | RigidBodyType::KinematicVelocityBased => {
@@ -1499,6 +1505,7 @@ impl RigidBodyActivation {
         } else {
             self.time_since_can_sleep = 0.0;
         }
+        log::debug!(target: "c201_sleep", "ELIGIBILITY body={trace_body:?} kind={body_type:?} can_sleep={can_sleep} pose_test_angular_ok_drift_m={pose_test:?} timer_before={timer_before:?} timer_after={:?} previous={previous_pose:?} current={pose:?} extent={max_extent:?} sq_linvel={sq_linvel:?} sq_angvel={sq_angvel:?} dt={dt:?} length_unit={length_unit:?} linear_threshold={:?} angular_threshold={:?} required={:?}", self.time_since_can_sleep, self.normalized_linear_threshold, self.angular_threshold, self.time_until_sleep);
     }
 }
 
@@ -1591,7 +1598,7 @@ mod tests {
         for _ in 0..steps {
             shift += shift_per_step;
             let pose = Pose::from_translation(Vector::X * shift);
-            activation.update_energy(RigidBodyType::Dynamic, 1.0, 0.0, 0.0, 1.0, &pose, dt);
+            activation.update_energy(RigidBodyType::Dynamic, 1.0, 0.0, 0.0, 1.0, &pose, dt, None);
         }
 
         activation
@@ -1612,6 +1619,7 @@ mod tests {
                 1.0,
                 &pose,
                 dt,
+                None,
             );
         }
 

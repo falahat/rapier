@@ -246,7 +246,7 @@ impl PhysicsPipeline {
             let observations = &mut self.sleep_observations;
             for handle in islands.active_bodies() {
                 let rb = bodies.index_mut_internal(handle);
-                IslandManager::update_body_energy(rb, soft_bodies, dt, length_unit);
+                IslandManager::update_body_energy(handle, rb, soft_bodies, dt, length_unit);
                 let effective_mass = rb.mprops.effective_mass();
                 rb.forces
                     .compute_effective_force_and_torque(gravity, effective_mass);
@@ -278,7 +278,13 @@ impl PhysicsPipeline {
                     let mut observations = Vec::new();
                     for handle in chunk {
                         let rb = bodies.index_mut_internal(*handle);
-                        IslandManager::update_body_energy(rb, soft_bodies, dt, length_unit);
+                        IslandManager::update_body_energy(
+                            *handle,
+                            rb,
+                            soft_bodies,
+                            dt,
+                            length_unit,
+                        );
                         let effective_mass = rb.mprops.effective_mass();
                         rb.forces
                             .compute_effective_force_and_torque(gravity, effective_mass);

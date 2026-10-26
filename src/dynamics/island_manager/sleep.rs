@@ -28,14 +28,18 @@ impl IslandManager {
     /// ```
     ///
     /// Only affects dynamic bodies (kinematic and fixed bodies don't sleep).
+    #[track_caller]
     pub fn wake_up(&mut self, bodies: &mut RigidBodySet, handle: RigidBodyHandle, strong: bool) {
+        let caller = core::panic::Location::caller();
         // NOTE: the use an Option here because there are many legitimate cases (like when
         //       deleting a joint attached to an already-removed body) where we could be
         //       attempting to wake-up a rigid-body that has already been deleted.
         if bodies.get(handle).map(|rb| !rb.is_fixed()) == Some(true) {
             let rb = bodies.index_mut_internal(handle);
 
+            let before = rb.activation;
             rb.activation.wake_up(strong);
+            log::debug!(target: "c201_sleep", "ISLAND_WAKE body={handle:?} strong={strong} colliders={:?} before={before:?} after={:?} caller={}:{}:{}", rb.colliders.0, rb.activation, caller.file(), caller.line(), caller.column());
             let persistent_id = rb.ids.island_id;
             let island_to_wake_up = rb.ids.active_island_id;
 
@@ -57,7 +61,9 @@ impl IslandManager {
                     let handles = island.bodies.clone();
                     for h in &handles {
                         if let Some(rb) = bodies.get_mut(*h) {
+                            let before = rb.activation;
                             rb.activation.wake_up(true);
+                            log::debug!(target: "c201_sleep", "ISLAND_PROPAGATE body={h:?} trigger={handle:?} strong=true colliders={:?} before={before:?} after={:?} caller={}:{}:{}", rb.colliders.0, rb.activation, caller.file(), caller.line(), caller.column());
                         }
                     }
                     for h in handles {
