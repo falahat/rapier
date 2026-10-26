@@ -19,8 +19,6 @@ pub(crate) use self::contact_pair::PairEventStatus;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::SOLVER_DYNAMIC_COLOR_COUNT;
 #[cfg(feature = "alloc")]
-pub(crate) use self::contact_pair::relative_pose_drift;
-#[cfg(feature = "alloc")]
 pub use self::contact_pair::{
     ContactData, ContactId, ContactManifoldData, ContactPair, IntersectionPair, NEW_CONTACT_BIT,
     PairContacts, RigidPairContacts, SimdSolverContact, SolverContact, SolverContactGeneric,

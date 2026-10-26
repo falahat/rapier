@@ -43,7 +43,7 @@ fn off_center_sleep_displacement_is_frame_invariant() {
     assert!(shifted_drift < 2.0 * 0.001 / 60.0);
     // The former origin-plus-sphere metric rejects this same physical movement.
     assert!(
-        crate::geometry::relative_pose_drift(
+        crate::geometry::contact_pair::relative_pose_drift(
             &Pose::IDENTITY,
             &shifted_current,
             off_center.bodies[b].mass_properties().max_extent(),
