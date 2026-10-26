@@ -344,6 +344,11 @@ pub struct RigidBodyMassProps {
     /// Union of enabled attached collider bounds in the body frame, updated with
     /// `max_extent`. `None` means no enabled attached collider. Kept with the mass
     /// properties in snapshots so continuation uses the same sleep geometry.
+    /// The key is required on load; explicit None still denotes no attached collider.
+    #[cfg_attr(
+        feature = "serde-serialize",
+        serde(deserialize_with = "serde::Deserialize::deserialize")
+    )]
     pub(crate) local_aabb: Option<Aabb>,
 }
 

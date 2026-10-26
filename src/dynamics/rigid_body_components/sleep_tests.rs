@@ -193,6 +193,27 @@ fn sleep_geometry_and_timer_continue_across_restore() {
     for _ in 0..7 {
         world.step();
     }
+    let properties = world.bodies[body].mass_properties();
+    let mut missing = serde_json::to_value(properties).unwrap();
+    assert!(
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("local_aabb")
+            .is_some()
+    );
+    let error = serde_json::from_value::<RigidBodyMassProps>(missing).unwrap_err();
+    assert!(
+        error.to_string().contains("missing field `local_aabb`"),
+        "{error}"
+    );
+    let empty = RigidBodyMassProps::default();
+    let explicit_none = serde_json::to_value(&empty).unwrap();
+    assert!(explicit_none["local_aabb"].is_null());
+    assert_eq!(
+        serde_json::from_value::<RigidBodyMassProps>(explicit_none).unwrap(),
+        empty
+    );
     let bytes = bincode::serialize(&world).unwrap();
     let mut restored: PhysicsWorld = bincode::deserialize(&bytes).unwrap();
     assert_eq!(
