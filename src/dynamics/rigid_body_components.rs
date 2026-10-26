@@ -6,8 +6,8 @@ use crate::control::PdErrors;
 use crate::control::PidController;
 use crate::dynamics::MassProperties;
 use crate::geometry::{
-    ColliderChanges, ColliderHandle, ColliderMassProps, ColliderParent, ColliderPosition,
-    ColliderSet, ColliderShape, ModifiedColliders,
+    Aabb, BoundingVolume, ColliderChanges, ColliderHandle, ColliderMassProps, ColliderParent,
+    ColliderPosition, ColliderSet, ColliderShape, ModifiedColliders,
 };
 use crate::math::{AngVector, AngularInertia, Pose, Real, Rotation, Vector};
 use crate::utils::{
@@ -337,10 +337,14 @@ pub struct RigidBodyMassProps {
     /// Mass-properties of this rigid-bodies, added to the contributions of its attached colliders.
     pub additional_local_mprops: Option<Box<RigidBodyAdditionalMassProps>>,
     /// Conservative bound on the distance of any shape point from the local center of mass;
-    /// the sleep metric and the CCD fast-body criterion use it to turn angular velocity into
-    /// a farthest-point speed. Updated with the mass properties; `0` for collider-less bodies.
+    /// the CCD fast-body criterion uses it to turn angular velocity into a farthest-point
+    /// speed. Updated with the mass properties; `0` for collider-less bodies.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) max_extent: Real,
+    /// Union of enabled attached collider bounds in the body frame, updated with
+    /// `max_extent`. `None` means no enabled attached collider. Kept with the mass
+    /// properties in snapshots so continuation uses the same sleep geometry.
+    pub(crate) local_aabb: Option<Aabb>,
 }
 
 impl Default for RigidBodyMassProps {
@@ -353,6 +357,7 @@ impl Default for RigidBodyMassProps {
             effective_inv_mass: Vector::ZERO,
             effective_world_inv_inertia: AngularInertia::zero(),
             max_extent: 0.0,
+            local_aabb: None,
         }
     }
 }
@@ -508,7 +513,7 @@ impl RigidBodyMassProps {
     }
 
     /// Updates [`Self::max_extent`] from the attached colliders' bounding
-    /// spheres, measured about the local center of mass.
+    /// spheres, measured about the local center of mass, and the body-local sleep bounds.
     pub(crate) fn recompute_max_extent(
         &mut self,
         colliders: &ColliderSet,
@@ -516,6 +521,7 @@ impl RigidBodyMassProps {
     ) {
         let local_com = self.local_mprops.local_com;
         let mut max_extent: Real = 0.0;
+        let mut local_aabb: Option<Aabb> = None;
         for handle in &attached_colliders.0 {
             if let Some(co) = colliders.get(*handle) {
                 if co.is_enabled() {
@@ -526,21 +532,55 @@ impl RigidBodyMassProps {
                             .transform_by(&co_parent.pos_wrt_parent);
                         let extent = (sphere.center - local_com).length() + sphere.radius;
                         max_extent = max_extent.max(extent);
+                        let bounds = co.shape.compute_aabb(&co_parent.pos_wrt_parent);
+                        assert!(
+                            bounds.mins.is_finite()
+                                && bounds.maxs.is_finite()
+                                && bounds.mins.cmple(bounds.maxs).all(),
+                            "attached collider bounds must be finite and ordered"
+                        );
+                        if let Some(union) = &mut local_aabb {
+                            union.merge(&bounds);
+                        } else {
+                            local_aabb = Some(bounds);
+                        }
                     }
                 }
             }
         }
         self.max_extent = max_extent;
+        self.local_aabb = local_aabb;
     }
 
     /// Conservative bound on the distance of any point of the body's shapes
     /// from its local center of mass. `0` for collider-less bodies.
     ///
-    /// Used by the sleep metric and the CCD fast-body criterion to turn angular
-    /// velocity into a farthest-point speed.
+    /// Used by the CCD fast-body criterion to turn angular velocity into a farthest-point speed.
     #[inline]
     pub fn max_extent(&self) -> Real {
         self.max_extent
+    }
+
+    /// Conservative displacement bound: rigid displacement is affine in a local
+    /// point, so its norm over an AABB is no larger than the largest corner's.
+    fn max_point_displacement(&self, previous: &Pose, current: &Pose) -> Real {
+        let Some(bounds) = self.local_aabb else {
+            assert_eq!(
+                self.max_extent, 0.0,
+                "collider extent requires local bounds"
+            );
+            return (current.translation - previous.translation).length();
+        };
+        let delta = previous.inverse() * *current;
+        let mut largest: Real = 0.0;
+        for corner in bounds.vertices() {
+            let squared = (delta.transform_point(corner) - corner).length_squared();
+            if squared.is_nan() {
+                return squared;
+            }
+            largest = largest.max(squared);
+        }
+        largest.sqrt()
     }
 
     /// Update the world-space mass properties of `self`, taking into account the new position.
@@ -1321,9 +1361,10 @@ impl RigidBodyDominance {
 pub struct RigidBodyActivation {
     /// Velocity threshold for sleeping (scaled by `length_unit`).
     ///
-    /// Compared against the body's farthest-point speed (`|linvel| + |angvel| * max_extent`)
-    /// and against its farthest-point displacement rate (so solver position
-    /// corrections count as motion too). If negative, body never sleeps. Default: 0.05 units/second.
+    /// Compared against half the maximum per-step displacement of the body-local
+    /// collider AABB's corners, divided by the timestep (so solver position
+    /// corrections count as motion too). Soft frames use their fastest particle.
+    /// If negative, body never sleeps. Default: 0.05 units/second.
     pub normalized_linear_threshold: Real,
 
     /// Angular velocity threshold for sleeping (radians/second).
@@ -1444,7 +1485,7 @@ impl RigidBodyActivation {
         length_unit: Real,
         sq_linvel: Real,
         sq_angvel: Real,
-        max_extent: Real,
+        mprops: &RigidBodyMassProps,
         pose: &Pose,
         dt: Real,
     ) {
@@ -1468,7 +1509,7 @@ impl RigidBodyActivation {
             RigidBodyType::Dynamic => {
                 let linear_threshold = self.normalized_linear_threshold * length_unit;
                 let prev_pose = core::mem::replace(&mut self.sleep_prev_pose, *pose);
-                let angular_ok = if max_extent > 0.0 {
+                let angular_ok = if mprops.max_extent > 0.0 {
                     use crate::num::FloatConst;
                     // Use a fixed angular threshold that unambiguously imply movement.
                     // The position-based criteria will be more restrictive, but we keep
@@ -1483,7 +1524,7 @@ impl RigidBodyActivation {
                     sq_angvel < self.angular_threshold * self.angular_threshold.abs()
                 };
 
-                let drift = crate::geometry::relative_pose_drift(&prev_pose, pose, max_extent);
+                let drift = mprops.max_point_displacement(&prev_pose, pose);
                 angular_ok && drift * 0.5 < linear_threshold * dt
             }
             RigidBodyType::KinematicPositionBased | RigidBodyType::KinematicVelocityBased => {
@@ -1582,6 +1623,14 @@ mod tests {
         }
     }
 
+    fn sleep_mass_props() -> RigidBodyMassProps {
+        RigidBodyMassProps {
+            max_extent: Vector::ONE.length(),
+            local_aabb: Some(Aabb::from_half_extents(Vector::ZERO, Vector::ONE)),
+            ..Default::default()
+        }
+    }
+
     /// Runs `steps` of `update_energy` on a body that only ever moves by `shift_per_step`
     /// (zero velocity: the motion stands for solver position corrections).
     fn creep(shift_per_step: Real, steps: usize, dt: Real) -> RigidBodyActivation {
@@ -1591,7 +1640,15 @@ mod tests {
         for _ in 0..steps {
             shift += shift_per_step;
             let pose = Pose::from_translation(Vector::X * shift);
-            activation.update_energy(RigidBodyType::Dynamic, 1.0, 0.0, 0.0, 1.0, &pose, dt);
+            activation.update_energy(
+                RigidBodyType::Dynamic,
+                1.0,
+                0.0,
+                0.0,
+                &sleep_mass_props(),
+                &pose,
+                dt,
+            );
         }
 
         activation
@@ -1609,7 +1666,7 @@ mod tests {
                 1.0,
                 linvel * linvel,
                 0.0,
-                1.0,
+                &sleep_mass_props(),
                 &pose,
                 dt,
             );
@@ -1644,3 +1701,7 @@ mod tests {
         assert!(creep(0.0, steps, dt).is_eligible_for_sleep());
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "dim3")]
+mod sleep_tests;

@@ -381,7 +381,7 @@ impl IslandManager {
             length_unit,
             sq_linvel,
             sq_angvel,
-            rb.mprops.max_extent(),
+            &rb.mprops,
             &pose,
             dt,
         );
