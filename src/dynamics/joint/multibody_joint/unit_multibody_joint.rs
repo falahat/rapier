@@ -25,6 +25,15 @@ pub fn unit_joint_limit_constraint(
     let min_enabled = curr_pos < limits[0];
     let max_enabled = limits[1] < curr_pos;
 
+    // Inside its range the limit can push neither way: its row keeps its
+    // slot and its share of the jacobians, but holds nothing to solve.
+    if !min_enabled && !max_enabled {
+        constraints[*insert_at] = GenericJointConstraint::inert(WritebackId::Limit(dof_id));
+        *insert_at += 1;
+        *j_id += 2 * ndofs;
+        return;
+    }
+
     // Compute per-joint ERP and CFM
     let erp_inv_dt = softness.erp_inv_dt(params.dt);
     let cfm_coeff = softness.cfm_coeff(params.dt);

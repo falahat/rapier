@@ -61,6 +61,30 @@ impl GenericJointConstraint {
         }
     }
 
+    /// A row that pushes nothing: it holds no body, so the solver passes
+    /// over it, keeping its slot in a layout fixed for the step.
+    pub fn inert(writeback_id: WritebackId) -> Self {
+        Self {
+            is_rigid_body1: false,
+            is_rigid_body2: false,
+            solver_vel1: u32::MAX,
+            solver_vel2: u32::MAX,
+            ndofs1: 0,
+            j_id1: 0,
+            ndofs2: 0,
+            j_id2: 0,
+            joint_id: usize::MAX,
+            impulse: 0.0,
+            impulse_bounds: [0.0, 0.0],
+            inv_lhs: 0.0,
+            rhs: 0.0,
+            rhs_wo_bias: 0.0,
+            cfm_coeff: 0.0,
+            cfm_gain: 0.0,
+            writeback_id,
+        }
+    }
+
     pub fn lock_axes(
         params: &IntegrationParameters,
         joint_id: JointIndex,
