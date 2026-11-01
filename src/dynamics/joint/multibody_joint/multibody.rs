@@ -842,13 +842,13 @@ impl Multibody {
         }
 
         let mut curr_assembly_id = 0;
+        let mut link_dofs = Vec::new();
 
         for i in 0..self.links.len() {
             let link = &self.links[i];
             let rb = &bodies[link.rigid_body];
             let rb_mass = rb.mprops.effective_mass();
             let rb_inertia = rb.mprops.effective_angular_inertia().into_matrix();
-            let body_jacobian = &self.body_jacobians[i];
 
             // NOTE: the mass matrix index reordering operates on the assumption that the assembly
             //       ids are traversed in order. This assert is here to ensure the assumption always
@@ -887,10 +887,20 @@ impl Multibody {
             let rb_mass_matrix_wo_gyro = concat_rb_mass_matrix(rb_mass, rb_inertia.into());
             #[allow(clippy::useless_conversion)] // Needed in 3D, no-op in 2D
             let rb_mass_matrix = concat_rb_mass_matrix(rb_mass, augmented_inertia.into());
-            self.augmented_mass
-                .quadform(1.0, &rb_mass_matrix_wo_gyro, body_jacobian, 1.0);
-            self.acc_augmented_mass
-                .quadform(1.0, &rb_mass_matrix, body_jacobian, 1.0);
+
+            // The link moves only with its own joint and its ancestors', so its
+            // Jacobian and coriolis terms are zero in every other column: a
+            // branched tree's other limbs are left out of its work below.
+            link_dofs.clear();
+            let mut ancestor = i;
+            loop {
+                let link = &self.links[ancestor];
+                link_dofs.extend(link.assembly_id..link.assembly_id + link.joint.ndofs());
+                if ancestor == 0 {
+                    break;
+                }
+                ancestor = link.parent_internal_id;
+            }
 
             /*
              *
@@ -918,28 +928,28 @@ impl Multibody {
 
                 // [c1 - c0].gcross() * (JDot + JDot/u * qdot)"
                 let shift_cross_tr = vect_to_na(link.shift02).gcross_matrix_tr();
-                coriolis_v.gemm(1.0, &shift_cross_tr, parent_coriolis_w, 1.0);
-
                 // JDot (but the 2.0 originates from the sum of two identical terms in JDot and JDot/u * gdot)
                 let dvel_cross = vect_to_na(
                     rb.vels.angvel.gcross(link.shift02) + 2.0 * link.joint_velocity.linvel,
                 )
                 .gcross_matrix_tr();
-                coriolis_v.gemm(1.0, &dvel_cross, &parent_j_w, 1.0);
-
                 // JDot/u * qdot
-                coriolis_v.gemm(
-                    1.0,
-                    &vect_to_na(link.joint_velocity.linvel).gcross_matrix_tr(),
-                    &parent_j_w,
-                    1.0,
-                );
-                coriolis_v.gemm(1.0, &(parent_w * shift_cross_tr), &parent_j_w, 1.0);
-
+                let joint_vel_cross = vect_to_na(link.joint_velocity.linvel).gcross_matrix_tr();
+                let parent_w_shift = parent_w * shift_cross_tr;
                 #[cfg(feature = "dim3")]
-                {
-                    let vel_wrt_joint_w = vect_to_na(link.joint_velocity.angvel).gcross_matrix();
-                    coriolis_w.gemm(-1.0, &vel_wrt_joint_w, &parent_j_w, 1.0);
+                let vel_wrt_joint_w = vect_to_na(link.joint_velocity.angvel).gcross_matrix();
+
+                for &k in &link_dofs {
+                    let mut coriolis_v = coriolis_v.column_mut(k);
+                    let parent_j_w = parent_j_w.column(k);
+                    coriolis_v.gemv(1.0, &shift_cross_tr, &parent_coriolis_w.column(k), 1.0);
+                    coriolis_v.gemv(1.0, &dvel_cross, &parent_j_w, 1.0);
+                    coriolis_v.gemv(1.0, &joint_vel_cross, &parent_j_w, 1.0);
+                    coriolis_v.gemv(1.0, &parent_w_shift, &parent_j_w, 1.0);
+                    #[cfg(feature = "dim3")]
+                    coriolis_w
+                        .column_mut(k)
+                        .gemv(-1.0, &vel_wrt_joint_w, &parent_j_w, 1.0);
                 }
 
                 // JDot (but the 2.0 originates from the sum of two identical terms in JDot and JDot/u * gdot)
@@ -970,55 +980,60 @@ impl Multibody {
             }
 
             let coriolis_v = &mut self.coriolis_v[i];
-            let coriolis_w = &mut self.coriolis_w[i];
+            let coriolis_w = &self.coriolis_w[i];
 
             {
                 // [c3 - c2].gcross() * (JDot + JDot/u * qdot)
                 let shift_cross_tr = vect_to_na(link.shift23).gcross_matrix_tr();
-                coriolis_v.gemm(1.0, &shift_cross_tr, coriolis_w, 1.0);
-
                 // JDot
                 let dvel_cross = vect_to_na(rb.vels.angvel.gcross(link.shift23)).gcross_matrix_tr();
-                coriolis_v.gemm(1.0, &dvel_cross, &rb_j_w, 1.0);
-
                 // JDot/u * qdot
-                coriolis_v.gemm(
-                    1.0,
-                    &(SimdAngVector::<Real>::from(rb.vels.angvel).gcross_matrix() * shift_cross_tr),
-                    &rb_j_w,
-                    1.0,
-                );
-            }
+                let w_shift =
+                    SimdAngVector::<Real>::from(rb.vels.angvel).gcross_matrix() * shift_cross_tr;
 
-            let coriolis_v = &mut self.coriolis_v[i];
-            let coriolis_w = &mut self.coriolis_w[i];
+                for &k in &link_dofs {
+                    let mut coriolis_v = coriolis_v.column_mut(k);
+                    let rb_j_w = rb_j_w.column(k);
+                    coriolis_v.gemv(1.0, &shift_cross_tr, &coriolis_w.column(k), 1.0);
+                    coriolis_v.gemv(1.0, &dvel_cross, &rb_j_w, 1.0);
+                    coriolis_v.gemv(1.0, &w_shift, &rb_j_w, 1.0);
+                }
+            }
 
             /*
              * Meld with the mass matrix.
              */
-            {
-                let mut i_coriolis_dt_v = self.i_coriolis_dt.fixed_rows_mut::<DIM>(0);
-                i_coriolis_dt_v.copy_from(coriolis_v);
-                let rb_mass_dt = vect_to_na(rb_mass * dt);
-                i_coriolis_dt_v
-                    .column_iter_mut()
-                    .for_each(|mut c| c.component_mul_assign(&rb_mass_dt));
+            let rb_mass_dt = vect_to_na(rb_mass * dt);
+            for &k in &link_dofs {
+                let mut i_coriolis_dt = self.i_coriolis_dt.column_mut(k);
+                i_coriolis_dt
+                    .fixed_rows_mut::<DIM>(0)
+                    .copy_from(&coriolis_v.column(k).component_mul(&rb_mass_dt));
+                #[cfg(feature = "dim2")]
+                {
+                    i_coriolis_dt[DIM] = coriolis_w[(0, k)] * dt * rb_inertia;
+                }
+                #[cfg(feature = "dim3")]
+                i_coriolis_dt.fixed_rows_mut::<ANG_DIM>(DIM).gemv(
+                    dt,
+                    &mat_to_na(rb_inertia),
+                    &coriolis_w.column(k),
+                    0.0,
+                );
             }
 
-            #[cfg(feature = "dim2")]
-            {
-                let mut i_coriolis_dt_w = self.i_coriolis_dt.fixed_rows_mut::<ANG_DIM>(DIM);
-                // NOTE: this is just an axpy, but on row columns.
-                i_coriolis_dt_w.zip_apply(coriolis_w, |o, x| *o = x * dt * rb_inertia);
+            // Its share of the mass matrices, `Jᵀ·M·J` and the coriolis
+            // `Jᵀ·I_c·dt`, lies only where two of its DoFs meet.
+            for &b in &link_dofs {
+                let j_b = rb_j.column(b);
+                let mass_j = rb_mass_matrix_wo_gyro * j_b;
+                let acc_mass_j = rb_mass_matrix * j_b + self.i_coriolis_dt.column(b);
+                for &a in &link_dofs {
+                    let j_a = rb_j.column(a);
+                    self.augmented_mass[(a, b)] += j_a.dot(&mass_j);
+                    self.acc_augmented_mass[(a, b)] += j_a.dot(&acc_mass_j);
+                }
             }
-            #[cfg(feature = "dim3")]
-            {
-                let mut i_coriolis_dt_w = self.i_coriolis_dt.fixed_rows_mut::<ANG_DIM>(DIM);
-                i_coriolis_dt_w.gemm(dt, &mat_to_na(rb_inertia), coriolis_w, 0.0);
-            }
-
-            self.acc_augmented_mass
-                .gemm_tr(1.0, rb_j, &self.i_coriolis_dt, 1.0);
         }
 
         /*
