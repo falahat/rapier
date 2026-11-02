@@ -1,3 +1,4 @@
+use super::mass_factors::{MassFactors, ROOT};
 use super::multibody_link::{MultibodyLink, MultibodyLinkVec};
 use super::multibody_workspace::MultibodyWorkspace;
 use crate::alloc_prelude::*;
@@ -110,7 +111,7 @@ pub struct Multibody {
     //       move dofs from/to a format that matches the augmented mass.
     // TODO: use sparse matrices?
     augmented_mass: DMatrix<Real>,
-    inv_augmented_mass: LU<Real, Dyn, Dyn>,
+    mass_factors: MassFactors,
     // The indexing sequence for moving all kinematics degrees of
     // freedoms to the end of the generalized coordinates vector.
     augmented_mass_indices: IndexSequence,
@@ -157,7 +158,7 @@ impl Multibody {
             accelerations: DVector::zeros(0),
             body_jacobians: Vec::new(),
             augmented_mass: DMatrix::zeros(0, 0),
-            inv_augmented_mass: LU::new(DMatrix::zeros(0, 0)),
+            mass_factors: MassFactors::default(),
             acc_augmented_mass: DMatrix::zeros(0, 0),
             acc_inv_augmented_mass: LU::new(DMatrix::zeros(0, 0)),
             augmented_mass_indices: IndexSequence::new(),
@@ -362,9 +363,9 @@ impl Multibody {
         self.self_contacts_enabled = enabled;
     }
 
-    /// The inverse augmented mass matrix of this multibody.
-    pub fn inv_augmented_mass(&self) -> &LU<Real, Dyn, Dyn> {
-        &self.inv_augmented_mass
+    /// The factors that solve with the augmented mass matrix of this multibody.
+    pub fn inv_augmented_mass(&self) -> &MassFactors {
+        &self.mass_factors
     }
 
     /// The first link of this multibody.
@@ -716,7 +717,7 @@ impl Multibody {
                 self.augmented_mass_indices.with_rearranged_rows_mut(
                     &mut self.accelerations,
                     |accs| {
-                        self.inv_augmented_mass.solve_mut(accs);
+                        self.mass_factors.solve_mut(accs);
                     },
                 );
 
@@ -1092,11 +1093,34 @@ impl Multibody {
                 .view((0, 0), (effective_dim, effective_dim))
                 .into_owned(),
         );
-        self.inv_augmented_mass = LU::new(
-            self.augmented_mass
-                .view((0, 0), (effective_dim, effective_dim))
-                .into_owned(),
-        );
+        // Every joint and contact row solves with the plain matrix, many a
+        // substep; the coriolis one answers only the free accelerations, so it
+        // keeps its dense factors.
+        let parents = (effective_dim == self.ndofs).then(|| self.dof_parents());
+        self.mass_factors =
+            MassFactors::of(&self.augmented_mass, effective_dim, parents.as_deref());
+    }
+
+    /// Each degree of freedom's parent in the joint tree: the one before it
+    /// in its own joint, or else the last of its nearest moving ancestor's.
+    fn dof_parents(&self) -> Vec<usize> {
+        let mut parents = vec![ROOT; self.ndofs];
+        for (i, link) in self.links.iter().enumerate() {
+            let mut above = ROOT;
+            let mut ancestor = i;
+            while ancestor != 0 && above == ROOT {
+                ancestor = self.links[ancestor].parent_internal_id;
+                let held = &self.links[ancestor];
+                if held.joint.ndofs() > 0 {
+                    above = held.assembly_id + held.joint.ndofs() - 1;
+                }
+            }
+            let first = link.assembly_id;
+            for dof in first..first + link.joint.ndofs() {
+                parents[dof] = if dof == first { above } else { dof - 1 };
+            }
+        }
+        parents
     }
 
     /// Per-DoF inverse joint-space inertia `diag(M⁻¹)` at the current configuration, where `M`
@@ -1116,8 +1140,8 @@ impl Multibody {
         if n == 0 {
             return out;
         }
-        // `(M⁻¹)[i, i]` for each DoF: solve `M x = e_i` and read `x[i]`. The `inv_augmented_mass`
-        // factorization lives in the kinematic-reduced ordering, so route the unit vector through
+        // `(M⁻¹)[i, i]` for each DoF: solve `M x = e_i` and read `x[i]`. The `mass_factors`
+        // live in the kinematic-reduced ordering, so route the unit vector through
         // the same rearrangement the solver uses.
         let mut e = DVector::zeros(n);
         for i in 0..n {
@@ -1125,7 +1149,7 @@ impl Multibody {
             e[i] = 1.0;
             self.augmented_mass_indices
                 .with_rearranged_rows_mut(&mut e, |b| {
-                    self.inv_augmented_mass.solve_mut(b);
+                    self.mass_factors.solve_mut(b);
                 });
             out[i] = e[i];
         }
@@ -1215,7 +1239,7 @@ impl Multibody {
             for k in 0..ndofs {
                 jacobians[j_id + ndofs + k] = jacobians[j_id + k];
             }
-            self.inv_augmented_mass
+            self.mass_factors
                 .solve_mut(&mut jacobians.rows_mut(j_id + ndofs, ndofs));
 
             // lhs = Jᵀ M⁻¹ J = Σ J[k]·WJ[k]; only g1/g2 entries of J are nonzero.
@@ -1642,7 +1666,7 @@ impl Multibody {
             let mut out_invm_j = jacobians.rows_mut(wj_id, self.ndofs);
             self.augmented_mass_indices
                 .with_rearranged_rows_mut(&mut out_invm_j, |out_invm_j| {
-                    self.inv_augmented_mass.solve_mut(out_invm_j);
+                    self.mass_factors.solve_mut(out_invm_j);
                 });
         }
         let after = jacobians
@@ -1685,7 +1709,7 @@ impl Multibody {
             let mut out_invm_j = jacobians.rows_mut(wj_id, self.ndofs);
             self.augmented_mass_indices
                 .with_rearranged_rows_mut(&mut out_invm_j, |out_invm_j| {
-                    self.inv_augmented_mass.solve_mut(out_invm_j);
+                    self.mass_factors.solve_mut(out_invm_j);
                 });
         }
 
@@ -1758,7 +1782,7 @@ impl Multibody {
             let mut out_invm_j = jacobians.rows_mut(wj_id, self.ndofs);
             self.augmented_mass_indices
                 .with_rearranged_rows_mut(&mut out_invm_j, |out_invm_j| {
-                    self.inv_augmented_mass.solve_mut(out_invm_j);
+                    self.mass_factors.solve_mut(out_invm_j);
                 });
         }
 
