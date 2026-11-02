@@ -23,9 +23,11 @@ pub(crate) const ROOT: usize = usize::MAX;
 pub enum MassFactors {
     /// Along the joint tree.
     Tree {
-        /// Degree `k`'s ancestors are `ancestors[starts[k]..starts[k + 1]]`,
-        /// its parent first: an ancestor's own follow it in the list.
+        /// Where each degree's run of `ancestors` starts: degree `k`'s are
+        /// `ancestors[starts[k]..starts[k + 1]]`.
         starts: Vec<usize>,
+        /// Each degree's ancestors, its parent first: an ancestor's own follow
+        /// it in the list.
         ancestors: Vec<usize>,
         /// `L[k][i]` for each degree `k` and ancestor `i`, in `ancestors`' order.
         lower: Vec<Real>,
@@ -61,7 +63,11 @@ impl MassFactors {
         let mut starts = Vec::with_capacity(n + 1);
         starts.push(0);
         for (k, &parent) in parents.iter().enumerate() {
-            let depth = if parent == ROOT { 0 } else { starts[parent + 1] - starts[parent] + 1 };
+            let depth = if parent == ROOT {
+                0
+            } else {
+                starts[parent + 1] - starts[parent] + 1
+            };
             starts.push(starts[k] + depth);
         }
         let mut ancestors = Vec::with_capacity(starts[n]);
@@ -86,7 +92,10 @@ impl MassFactors {
                 let i = ancestors[starts[k] + m];
                 let share = row[m] / pivot;
                 pivots[i] -= share * row[m];
-                for (x, &y) in before[starts[i]..starts[i + 1]].iter_mut().zip(&row[m + 1..]) {
+                for (x, &y) in before[starts[i]..starts[i + 1]]
+                    .iter_mut()
+                    .zip(&row[m + 1..])
+                {
                     *x -= share * y;
                 }
                 row[m] = share;
@@ -102,7 +111,10 @@ impl MassFactors {
     }
 
     /// Solves `M·x = b` in place; `false` where dense factors are singular.
-    pub fn solve_mut<S: StorageMut<Real, Dyn, U1>>(&self, b: &mut Matrix<Real, Dyn, U1, S>) -> bool {
+    pub fn solve_mut<S: StorageMut<Real, Dyn, U1>>(
+        &self,
+        b: &mut Matrix<Real, Dyn, U1, S>,
+    ) -> bool {
         match self {
             MassFactors::Dense(lu) => lu.solve_mut(b),
             MassFactors::Tree {
