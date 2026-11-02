@@ -398,7 +398,13 @@ impl GenericContactConstraintBuilder {
         bodies: &SolverBodies,
         multibodies: &MultibodyJointSet,
         constraint: &mut GenericContactConstraint,
+        jacobians: &mut DVector,
     ) {
+        // `generate` weighted the rows by the step's first mass matrix, which its
+        // first substep still solves with.
+        if solved_dt > 0.0 {
+            self.reweigh(multibodies, constraint, jacobians);
+        }
         // Contacts touching a fixed body use a stiffer "static" softness.
         // A world-attached side has solver-vel id `u32::MAX`; exclude multibody links, whose
         // pose comes from the multibody path rather than a solver body.
@@ -415,7 +421,9 @@ impl GenericContactConstraintBuilder {
         let inv_dt = params.inv_dt();
         let erp_inv_dt = softness.erp_inv_dt(params.dt);
 
-        // We don't update jacobians so the update is mostly identical to the non-generic velocity constraint.
+        // The jacobians stay as `generate` built them, as a rigid contact's do (only
+        // their weighting by a jointed body's mass matrix follows it, `reweigh`), so
+        // the update is mostly identical to the non-generic velocity constraint.
         // Anchor frames must match `generate` exactly: identity for a world-attached side
         // (including sleeping multibody links, whose anchors are stored as world points),
         // the link pose for a live multibody side, the solver-body (CoM-centered) pose otherwise.
@@ -495,6 +503,64 @@ impl GenericContactConstraintBuilder {
         }
 
         constraint.cfm_factor = cfm_factor;
+    }
+
+    /// Each row's weighted jacobians `M⁻¹·J` and effective mass from the jointed
+    /// bodies' current mass matrices. A jointed body's mass matrix is rebuilt
+    /// between substeps and its joints' rows with it: a contact row left weighted
+    /// by the step's first matrix makes the solve's coupling between the two
+    /// lopsided, which can feed itself. A toppled humanoid's arm meeting the
+    /// ground so went from 9 to 763 rad/s within one step, and its whole body
+    /// to non-finite speeds three steps later.
+    fn reweigh(
+        &self,
+        multibodies: &MultibodyJointSet,
+        constraint: &mut GenericContactConstraint,
+        jacobians: &mut DVector,
+    ) {
+        let side = |handle: RigidBodyHandle, ndofs: usize| {
+            (ndofs > 0)
+                .then(|| multibodies.rigid_body_link(handle))
+                .flatten()
+                .map(|link| &multibodies[link.multibody])
+        };
+        let mb1 = side(self.handle1, constraint.ndofs1);
+        let mb2 = side(self.handle2, constraint.ndofs2);
+        if mb1.is_none() && mb2.is_none() {
+            return;
+        }
+        fn reweigh(
+            mb: Option<&crate::dynamics::Multibody>,
+            j_id: &mut usize,
+            jacobians: &mut DVector,
+        ) -> (Real, Real) {
+            let Some(mb) = mb else {
+                return (0.0, 0.0);
+            };
+            let both = mb.reweigh_jacobian(*j_id, jacobians);
+            *j_id += 2 * mb.ndofs();
+            both
+        }
+        // The effective mass is `1 / Σ J·M⁻¹·J`, a rigid side's share unchanged.
+        let rescale = |r: Real, before: Real, after: Real| match r == 0.0 {
+            true => 0.0,
+            false => utils::inv(utils::inv(r) - before + after),
+        };
+        // The rows' jacobians lie as `generate` filled them: each contact's normal,
+        // then its tangents, each the first body's then the second's.
+        let mut j_id = constraint.j_id;
+        for k in 0..constraint.num_contacts as usize {
+            let (b1, a1) = reweigh(mb1, &mut j_id, jacobians);
+            let (b2, a2) = reweigh(mb2, &mut j_id, jacobians);
+            let part = &mut constraint.normal_part[k];
+            part.r = rescale(part.r, b1 + b2, a1 + a2);
+            for j in 0..DIM - 1 {
+                let (b1, a1) = reweigh(mb1, &mut j_id, jacobians);
+                let (b2, a2) = reweigh(mb2, &mut j_id, jacobians);
+                let part = &mut constraint.tangent_part[k];
+                part.r[j] = rescale(part.r[j], b1 + b2, a1 + a2);
+            }
+        }
     }
 
     /// Does any active point of this constraint hold a restitution seed (an approaching

@@ -1624,6 +1624,33 @@ impl Multibody {
         self.ndofs
     }
 
+    /// Re-weights the jacobian `J` that [`Self::fill_jacobians`] stored at
+    /// `j_id` by the current inverse augmented mass, rewriting the `M⁻¹·J`
+    /// after it; returns `J·M⁻¹·J` before and after.
+    pub(crate) fn reweigh_jacobian(&self, j_id: usize, jacobians: &mut DVector) -> (Real, Real) {
+        if self.ndofs == 0 {
+            return (0.0, 0.0);
+        }
+        let wj_id = j_id + self.ndofs;
+        let before = jacobians
+            .rows(j_id, self.ndofs)
+            .dot(&jacobians.rows(wj_id, self.ndofs));
+        for i in 0..self.ndofs {
+            jacobians[wj_id + i] = jacobians[j_id + i];
+        }
+        {
+            let mut out_invm_j = jacobians.rows_mut(wj_id, self.ndofs);
+            self.augmented_mass_indices
+                .with_rearranged_rows_mut(&mut out_invm_j, |out_invm_j| {
+                    self.inv_augmented_mass.solve_mut(out_invm_j);
+                });
+        }
+        let after = jacobians
+            .rows(j_id, self.ndofs)
+            .dot(&jacobians.rows(wj_id, self.ndofs));
+        (before, after)
+    }
+
     pub(crate) fn fill_jacobians(
         &self,
         link_id: usize,
