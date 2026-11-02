@@ -57,9 +57,9 @@ impl StagedIslandSolver {
         // Substep solve-groups: each group (contiguous constraint-closed awake-body range, keyed
         // by max `additional_solver_iterations`) runs `base + extra` substeps at smaller dt —
         // real substeps buy convergence on high mass ratios, unlike the flat PGS sweeps they
-        // replaced. Multibody scenes: one group at max extra (generic tables not group-major yet).
+        // replaced. A multibody solves with its links' group, its generic rows tagged below.
         let island_bodies = islands.island(island_id).bodies();
-        let multi_group = islands.solve_groups.len() >= 2 && multibodies.iter().next().is_none();
+        let multi_group = islands.solve_groups.len() >= 2;
         let max_extra = islands
             .solve_groups
             .first()
@@ -90,6 +90,8 @@ impl StagedIslandSolver {
                     num_substeps,
                     num_pgs_iterations,
                     dt: base_params.dt / num_substeps as Real,
+                    multibody_roots: 0..0,
+                    multibody_dofs: 0..0,
                 });
             }
         } else {
@@ -108,13 +110,14 @@ impl StagedIslandSolver {
                 num_substeps,
                 num_pgs_iterations,
                 dt: base_params.dt / num_substeps as Real,
+                multibody_roots: 0..0,
+                multibody_dofs: 0..0,
             });
         }
         let num_solver_iterations = base_params.num_solver_iterations + max_extra;
 
-        // `params` keeps the FIRST group's substep dt (multibody precompute uses it; multibody
-        // scenes are always single-group). The worker loop re-derives each group's dt from
-        // `GroupLayout`.
+        // `params` keeps the FIRST group's substep dt (the soft contacts' assembly reads it). The
+        // multibody precompute and the worker loop take each group's dt from `GroupLayout`.
         let mut params = *base_params;
         params.dt /= num_solver_iterations as Real;
 
@@ -156,7 +159,7 @@ impl StagedIslandSolver {
         }
         let num_soft_slots = self.soft_constraints.slots.len();
         self.velocity_solver.init_solver_buffers_and_multibodies(
-            &params,
+            &mut self.groups,
             island_bodies,
             num_soft_slots,
             bodies,
@@ -583,6 +586,15 @@ impl StagedIslandSolver {
         // Generic (multibody) contact constraints: serial init, solved by worker 0.
         let mut jacobian_id = 0;
         set.compute_generic_constraints(bodies, multibodies, graph, store, &mut jacobian_id);
+        self.generic_groups.assign(
+            &self.groups,
+            graph
+                .generic()
+                .iter()
+                .map(|r| store.get(*r).data.solver_body_ids),
+            &self.joint_constraints,
+            multibodies,
+        );
 
         #[cfg(feature = "dim3")]
         self.any_gyroscopic.store(false, Ordering::Relaxed);
@@ -622,6 +634,7 @@ impl StagedIslandSolver {
             chunk_segments: &self.chunk_segments,
             num_chunks,
             groups: &self.groups,
+            generic_groups: &self.generic_groups,
             color_ranges: &self.color_ranges,
             joint_color_ranges: &self.joint_color_ranges,
             joint_rows: &self.joint_rows,

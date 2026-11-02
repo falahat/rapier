@@ -143,6 +143,73 @@ struct GroupLayout {
     num_pgs_iterations: usize,
     /// This group's substep length (`base_dt / num_substeps`).
     dt: Real,
+    /// This group's multibodies, a range of the velocity solver's `multibody_roots`.
+    multibody_roots: Range<usize>,
+    /// Their degrees of freedom, a row range of the generic solver velocities.
+    multibody_dofs: Range<usize>,
+}
+
+/// The solve group of each generic (multibody) constraint, so that a group
+/// solves only the rows of its own jointed bodies, at its own substeps: the
+/// group of the bodies a row moves. Empty on the single-group path, where
+/// every row belongs to the only group.
+#[derive(Clone, Default)]
+struct GenericGroups {
+    /// Per generic contact constraint.
+    contacts: Vec<u16>,
+    /// Per generic joint constraint row.
+    joint_rows: Vec<u16>,
+    /// Per generic joint constraint builder: the group of its rows.
+    joint_builders: Vec<u16>,
+}
+
+impl GenericGroups {
+    /// Whether entry `i` of the table `of` belongs to `group`.
+    fn holds(of: &[u16], i: usize, group: usize) -> bool {
+        of.get(i).is_none_or(|g| *g as usize == group)
+    }
+
+    /// Tags the island's generic constraints, given the solver bodies of each generic contact:
+    /// a contact's group is the highest among its in-island sides', as for the two-body contacts
+    /// (a kinematic side sits in the highest-cadence group it touches); a joint's is its
+    /// multibody's (any other side it joins shares the group), and so are its rows'.
+    fn assign(
+        &mut self,
+        groups: &[GroupLayout],
+        contact_bodies: impl Iterator<Item = [u32; 2]>,
+        joints: &JointConstraintsSet,
+        multibodies: &MultibodyJointSet,
+    ) {
+        self.contacts.clear();
+        self.joint_rows.clear();
+        self.joint_builders.clear();
+        if groups.len() < 2 {
+            return;
+        }
+        let of_slot = |slot: u32| {
+            groups
+                .iter()
+                .position(|g| g.bodies.contains(&(slot as usize)))
+        };
+        let tag = |group: Option<usize>| group.map_or(0, |g| g as u16);
+        self.contacts
+            .extend(contact_bodies.map(|[b1, b2]| tag(of_slot(b1).max(of_slot(b2)))));
+        let builders = &joints.generic_velocity_constraints_builder;
+        self.joint_builders.extend(builders.iter().map(|b| {
+            tag(b.link_and_first_row().and_then(|(link, _)| {
+                let dof = multibodies[link.multibody].solver_id as usize;
+                groups.iter().position(|g| g.multibody_dofs.contains(&dof))
+            }))
+        }));
+        // A builder's rows run up to the next builder's first: fill each one's tail in order.
+        self.joint_rows
+            .resize(joints.generic_velocity_constraints.len(), 0);
+        for (b, group) in builders.iter().zip(&self.joint_builders) {
+            if let Some((_, first)) = b.link_and_first_row() {
+                self.joint_rows[first..].fill(*group);
+            }
+        }
+    }
 }
 
 /// Per-group slices of the staged joint layout, persisted alongside the
@@ -172,6 +239,7 @@ struct SharedCtx<'a> {
     /// The substep solve-groups, group-major over every layout table below.
     /// Always at least one entry; exactly one on the ungrouped fast path.
     groups: &'a [GroupLayout],
+    generic_groups: &'a GenericGroups,
     color_ranges: &'a [(u8, Range<usize>)],
     joint_color_ranges: &'a [(u8, Range<usize>)],
     joint_rows: &'a [Range<usize>],
@@ -249,6 +317,7 @@ pub(crate) struct StagedIslandSolver {
     /// The substep solve-groups (see [`GroupLayout`]); rebuilt every step,
     /// single spanning entry on the ungrouped fast path.
     groups: Vec<GroupLayout>,
+    generic_groups: GenericGroups,
     /// Stable storage for the multi-group chunk refs: per-(group, color)
     /// contiguous copies of the persistent buckets' refs (the single-group
     /// path points straight into the buckets and never fills this).
@@ -321,6 +390,7 @@ impl StagedIslandSolver {
             overflow_chunk_refs: Vec::new(),
             color_ranges: Vec::new(),
             groups: Vec::new(),
+            generic_groups: GenericGroups::default(),
             grouped_chunk_refs: Vec::new(),
             overflow_workspace: Vec::new(),
             joint_colors: ParallelInteractionGroups::new(),

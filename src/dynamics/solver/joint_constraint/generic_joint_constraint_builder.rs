@@ -44,6 +44,23 @@ pub enum GenericJointConstraintBuilder {
     Empty, // No constraint
 }
 
+impl GenericJointConstraintBuilder {
+    /// The link whose multibody this builder's rows move (an external joint's first link side),
+    /// and the index of the first row it fills.
+    pub(crate) fn link_and_first_row(&self) -> Option<(MultibodyLinkId, usize)> {
+        match self {
+            Self::Internal(b) => Some((b.link, b.constraint_id)),
+            Self::External(b) => match (b.link1, b.link2) {
+                (LinkOrBody::Link(link), _) | (_, LinkOrBody::Link(link)) => {
+                    Some((link, b.constraint_id))
+                }
+                _ => None,
+            },
+            Self::Empty => None,
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct JointGenericExternalConstraintBuilder {
     link1: LinkOrBody,

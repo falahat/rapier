@@ -6,7 +6,7 @@ use crate::dynamics::IntegrationParameters;
 use crate::dynamics::solver::JointConstraintsSet;
 use crate::math::Real;
 
-use super::{SharedCtx, stage_batch};
+use super::{GenericGroups, SharedCtx, stage_batch};
 
 /// One solve pass: joints (colored, then overflow + generic on worker 0), soft-body rows, then
 /// contact colors (parallel); returns the updated stage ordinal. `soft_update` updates the soft
@@ -162,12 +162,14 @@ pub(super) unsafe fn solve_pass(
     // ALL joints (colored, overflow, generic) solve BEFORE any contact in every pass: the last
     // constraint solved on a body wins its velocity residual and contacts must win, else a joint
     // re-imposed after a heavier body's contacts lets it push through (heavy cube on a spring-hung
-    // ball). Generic constraints exist only single-group; vec lengths are fixed once laid out.
-    let has_generic_joints = ctx.groups.len() == 1
+    // ball). Generic (multibody) rows solve with their bodies' group; vec lengths are fixed once
+    // laid out.
+    let has_multibodies = !group.multibody_roots.is_empty();
+    let has_generic_joints = has_multibodies
         && !unsafe { &*ctx.joint_constraints }
             .generic_velocity_constraints
             .is_empty();
-    let has_generic_contacts = ctx.groups.len() == 1
+    let has_generic_contacts = has_multibodies
         && !unsafe { &*ctx.contact_constraints }
             .generic_velocity_constraints
             .is_empty();
@@ -226,7 +228,10 @@ pub(super) unsafe fn solve_pass(
                     generic_velocity_constraints,
                     ..
                 } = joints;
-                for c in generic_velocity_constraints.iter_mut() {
+                for (i, c) in generic_velocity_constraints.iter_mut().enumerate() {
+                    if !GenericGroups::holds(&ctx.generic_groups.joint_rows, i, group_index) {
+                        continue;
+                    }
                     if wo_bias {
                         c.remove_bias_from_rhs();
                     }
@@ -340,7 +345,10 @@ pub(super) unsafe fn solve_pass(
             let contacts = unsafe { &mut *ctx.contact_constraints };
             let vs = unsafe { &mut *ctx.velocity_solver };
             let jac = &contacts.generic_jacobians;
-            for c in contacts.generic_velocity_constraints.iter_mut() {
+            for (i, c) in contacts.generic_velocity_constraints.iter_mut().enumerate() {
+                if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                    continue;
+                }
                 if wo_bias {
                     c.remove_cfm_and_bias_from_rhs();
                 }

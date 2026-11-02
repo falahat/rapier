@@ -208,6 +208,88 @@ fn staged_multi_group_joint_simd_parity() {
     }
 }
 
+/// A multibody solves with its links' group, at that group's substeps: of two separate jointed
+/// chains at different cadences, each must move as it does when the whole scene runs at its own
+/// cadence (they share only the fixed ground, so nothing couples them), and the two cadences
+/// must move a chain differently enough to tell.
+#[test]
+fn staged_multi_group_multibody_cadence() {
+    use crate::alloc_prelude::*;
+    use crate::math::Real;
+    use crate::pipeline::PhysicsWorld;
+
+    // Two free-floating three-link chains dropped onto the ground, their joints limited so they
+    // add rows of their own; `extra` substeps for each chain. Returns the links' positions.
+    fn build(extra: [usize; 2]) -> Vec<Vector> {
+        let mut world = PhysicsWorld::new();
+        #[cfg(feature = "dim2")]
+        let (ground, link) = (ColliderBuilder::cuboid(50.0, 0.5), || {
+            ColliderBuilder::cuboid(0.5, 0.2)
+        });
+        #[cfg(feature = "dim3")]
+        let (ground, link) = (ColliderBuilder::cuboid(50.0, 0.5, 50.0), || {
+            ColliderBuilder::cuboid(0.5, 0.2, 0.2)
+        });
+        #[cfg(feature = "dim2")]
+        let joint = RevoluteJointBuilder::new;
+        #[cfg(feature = "dim3")]
+        let joint = || RevoluteJointBuilder::new(Vector::Z);
+
+        let _ = world.insert(RigidBodyBuilder::fixed(), ground);
+        let mut links = Vec::new();
+        for (chain, extra) in extra.into_iter().enumerate() {
+            let mut parent = None;
+            for i in 0..3 {
+                let at = Vector::X * (chain as Real * 10.0 + i as Real)
+                    + Vector::Y * (2.0 + 0.3 * i as Real);
+                let body = RigidBodyBuilder::dynamic()
+                    .translation(at)
+                    .additional_solver_iterations(extra)
+                    .can_sleep(false);
+                let (handle, _) = world.insert(body, link());
+                if let Some(parent) = parent {
+                    let joint = joint()
+                        .local_anchor1(Vector::X * 0.5)
+                        .local_anchor2(-Vector::X * 0.5)
+                        .limits([-0.5, 0.5]);
+                    world.insert_multibody_joint(parent, handle, joint).unwrap();
+                }
+                parent = Some(handle);
+                links.push(handle);
+            }
+        }
+        for _ in 0..60 {
+            world.step();
+        }
+        links
+            .iter()
+            .map(|h| world.bodies[*h].translation())
+            .collect()
+    }
+    let furthest = |a: &[Vector], b: &[Vector]| {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (*a - *b).length())
+            .fold(0.0, Real::max)
+    };
+
+    let fast = build([4, 4]);
+    let slow = build([0, 0]);
+    let mixed = build([4, 0]);
+    assert!(
+        furthest(&mixed[..3], &fast[..3]) < 1.0e-6,
+        "the faster chain moved unlike the scene at its cadence: {mixed:?} vs {fast:?}"
+    );
+    assert!(
+        furthest(&mixed[3..], &slow[3..]) < 1.0e-6,
+        "the slower chain moved unlike the scene at its cadence: {mixed:?} vs {slow:?}"
+    );
+    assert!(
+        furthest(&fast[3..], &slow[3..]) > 1.0e-4,
+        "the two cadences moved the chain alike: {fast:?} vs {slow:?}"
+    );
+}
+
 /// Substep-group partition: the awake body list must reorder into contiguous groups by
 /// component max `additional_solver_iterations` (descending), re-stamp the
 /// `active_set_id == index` invariant, and not churn the epoch once stable.

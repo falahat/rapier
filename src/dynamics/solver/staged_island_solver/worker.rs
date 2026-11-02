@@ -19,7 +19,7 @@ use crate::math::Real;
 use parry::math::SIMD_WIDTH;
 
 use super::solve::solve_pass;
-use super::{BODY_BATCH, SharedCtx, chunk_at, stage_batch};
+use super::{BODY_BATCH, GenericGroups, SharedCtx, chunk_at, stage_batch};
 
 /// Per-full-step angular rotation cap (0.25π ≈ 45°): bodies without
 /// `allow_fast_rotation` get their angular velocity clamped each substep so the full-step
@@ -318,9 +318,11 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                 sync.complete(stage, done, stage_work);
                 if worker_id == 0 {
                     let vs = unsafe { &mut *ctx.velocity_solver };
-                    let incr = core::mem::take(&mut vs.generic_solver_vels_increment);
-                    vs.generic_solver_vels += &incr;
-                    vs.generic_solver_vels_increment = incr;
+                    let dofs = group.multibody_dofs.clone();
+                    let mut vels = vs.generic_solver_vels.rows_mut(dofs.start, dofs.len());
+                    vels += &vs
+                        .generic_solver_vels_increment
+                        .rows(dofs.start, dofs.len());
                     sync.complete(stage, 1, stage_work);
                 }
                 stage = sync.sync(stage, stage_work);
@@ -448,53 +450,59 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                 sync.complete(stage, done, stage_work);
 
                 if worker_id == 0 {
-                    // Generic (multibody) constraints exist only on the
-                    // single-group path (multibody scenes never split).
-                    if ctx.groups.len() == 1 {
-                        let joints = unsafe { &mut *ctx.joint_constraints };
-                        let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
-                        let JointConstraintsSet {
-                            generic_velocity_constraints_builder,
-                            generic_jacobians,
-                            generic_velocity_constraints,
-                            ..
-                        } = joints;
-                        for builder in generic_velocity_constraints_builder.iter_mut() {
-                            match builder {
-                                GenericJointConstraintBuilder::External(b) => b.update(
-                                    params,
-                                    multibodies,
-                                    solver_bodies,
-                                    generic_jacobians,
-                                    generic_velocity_constraints,
-                                ),
-                                GenericJointConstraintBuilder::Internal(b) => b.update(
-                                    params,
-                                    multibodies,
-                                    generic_jacobians,
-                                    generic_velocity_constraints,
-                                ),
-                                GenericJointConstraintBuilder::Empty => {}
-                            }
+                    // This group's generic (multibody) constraints.
+                    let joints = unsafe { &mut *ctx.joint_constraints };
+                    let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
+                    let JointConstraintsSet {
+                        generic_velocity_constraints_builder,
+                        generic_jacobians,
+                        generic_velocity_constraints,
+                        ..
+                    } = joints;
+                    let builder_groups = &ctx.generic_groups.joint_builders;
+                    for (i, builder) in generic_velocity_constraints_builder.iter_mut().enumerate()
+                    {
+                        if !GenericGroups::holds(builder_groups, i, group_index) {
+                            continue;
                         }
+                        match builder {
+                            GenericJointConstraintBuilder::External(b) => b.update(
+                                params,
+                                multibodies,
+                                solver_bodies,
+                                generic_jacobians,
+                                generic_velocity_constraints,
+                            ),
+                            GenericJointConstraintBuilder::Internal(b) => b.update(
+                                params,
+                                multibodies,
+                                generic_jacobians,
+                                generic_velocity_constraints,
+                            ),
+                            GenericJointConstraintBuilder::Empty => {}
+                        }
+                    }
 
-                        if !fused_contact_update {
-                            let contacts = unsafe { &mut *ctx.contact_constraints };
-                            let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
-                            for (builder, constraint) in contacts
-                                .generic_velocity_constraints_builder
-                                .iter()
-                                .zip(contacts.generic_velocity_constraints.iter_mut())
-                            {
-                                builder.update(
-                                    params,
-                                    solved_dt,
-                                    solver_bodies,
-                                    multibodies,
-                                    constraint,
-                                    &mut contacts.generic_jacobians,
-                                );
+                    if !fused_contact_update {
+                        let contacts = unsafe { &mut *ctx.contact_constraints };
+                        let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
+                        for (i, (builder, constraint)) in contacts
+                            .generic_velocity_constraints_builder
+                            .iter()
+                            .zip(contacts.generic_velocity_constraints.iter_mut())
+                            .enumerate()
+                        {
+                            if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                                continue;
                             }
+                            builder.update(
+                                params,
+                                solved_dt,
+                                solver_bodies,
+                                multibodies,
+                                constraint,
+                                &mut contacts.generic_jacobians,
+                            );
                         }
                     }
                     sync.complete(stage, 1, stage_work);
@@ -592,11 +600,15 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
 
                     let contacts = unsafe { &mut *ctx.contact_constraints };
                     let vs = unsafe { &mut *ctx.velocity_solver };
-                    for (builder, c) in contacts
+                    for (i, (builder, c)) in contacts
                         .generic_velocity_constraints_builder
                         .iter()
                         .zip(contacts.generic_velocity_constraints.iter_mut())
+                        .enumerate()
                     {
+                        if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                            continue;
+                        }
                         builder.update(
                             params,
                             solved_dt,
@@ -709,7 +721,13 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     let vs = unsafe { &mut *ctx.velocity_solver };
                     let bodies = unsafe { &mut *ctx.bodies };
                     let multibodies = unsafe { &mut *ctx.multibodies };
-                    vs.integrate_multibody_positions(params, is_last_substep, bodies, multibodies);
+                    vs.integrate_multibody_positions(
+                        params,
+                        group.multibody_roots.clone(),
+                        is_last_substep,
+                        bodies,
+                        multibodies,
+                    );
                     sync.complete(stage, 1, num_group_bodies + 1);
                 }
                 stage = sync.sync(stage, num_group_bodies + 1);
@@ -798,22 +816,24 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     }
                 }
 
-                // Generic constraints exist only on the single-group path.
-                if ctx.groups.len() == 1 {
-                    let contacts = unsafe { &mut *ctx.contact_constraints };
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    for (builder, c) in contacts
-                        .generic_velocity_constraints_builder
-                        .iter()
-                        .zip(contacts.generic_velocity_constraints.iter_mut())
-                    {
-                        builder.apply_restitution(
-                            c,
-                            &contacts.generic_jacobians,
-                            &mut vs.solver_bodies,
-                            &mut vs.generic_solver_vels,
-                        );
+                // This group's generic (multibody) contacts.
+                let contacts = unsafe { &mut *ctx.contact_constraints };
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                for (i, (builder, c)) in contacts
+                    .generic_velocity_constraints_builder
+                    .iter()
+                    .zip(contacts.generic_velocity_constraints.iter_mut())
+                    .enumerate()
+                {
+                    if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                        continue;
                     }
+                    builder.apply_restitution(
+                        c,
+                        &contacts.generic_jacobians,
+                        &mut vs.solver_bodies,
+                        &mut vs.generic_solver_vels,
+                    );
                 }
                 sync.complete(stage, 1, 1);
             }
