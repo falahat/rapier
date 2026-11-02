@@ -6,6 +6,13 @@ use crate::dynamics::solver::{GenericJointConstraint, WritebackId};
 use crate::dynamics::{IntegrationParameters, JointMotor, Multibody};
 use crate::math::{DVector, Real};
 
+/// How near its limit a coordinate takes the limit's row (rad, or m for a
+/// sliding axis). Within it the row stops the coordinate at the limit during
+/// the substep; built only once past the limit, a load resting the joint on
+/// it carries the joint past every other substep and the push back leaves a
+/// speed the pose never shows, which keeps the body awake.
+const LIMIT_REACH: Real = 0.05;
+
 /// Initializes and generate the velocity constraints applicable to the multibody links attached
 /// to this multibody_joint.
 pub fn unit_joint_limit_constraint(
@@ -22,12 +29,15 @@ pub fn unit_joint_limit_constraint(
     softness: SpringCoefficients<Real>,
 ) {
     let ndofs = multibody.ndofs();
-    let min_enabled = curr_pos < limits[0];
-    let max_enabled = limits[1] < curr_pos;
+    // How far inside each limit the coordinate sits (negative past it); only
+    // the nearer one can stop it.
+    let gaps = [curr_pos - limits[0], limits[1] - curr_pos];
+    let max_side = gaps[1] < gaps[0];
+    let gap = gaps[max_side as usize];
 
-    // Inside its range the limit can push neither way: its row keeps its
-    // slot and its share of the jacobians, but holds nothing to solve.
-    if !min_enabled && !max_enabled {
+    // Far from both limits the row can push neither way: it keeps its slot
+    // and its share of the jacobians, but holds nothing to solve.
+    if gap >= LIMIT_REACH {
         constraints[*insert_at] = GenericJointConstraint::inert(WritebackId::Limit(dof_id));
         *insert_at += 1;
         *j_id += 2 * ndofs;
@@ -38,8 +48,11 @@ pub fn unit_joint_limit_constraint(
     let erp_inv_dt = softness.erp_inv_dt(params.dt);
     let cfm_coeff = softness.cfm_coeff(params.dt);
 
-    let rhs_bias = ((curr_pos - limits[1]).max(0.0) - (limits[0] - curr_pos).max(0.0)) * erp_inv_dt;
-    let rhs_wo_bias = 0.0;
+    // Inside, the coordinate may close the gap within the substep; past, the
+    // bias brings it back. The max limit pushes it down, the min one up.
+    let sign = if max_side { -1.0 } else { 1.0 };
+    let rhs_wo_bias = sign * gap.max(0.0) * params.inv_dt();
+    let rhs_bias = -sign * (-gap).max(0.0) * erp_inv_dt;
 
     let dof_j_id = *j_id + dof_id + link.assembly_id;
     jacobians.rows_mut(*j_id, ndofs * 2).fill(0.0);
@@ -50,10 +63,11 @@ pub fn unit_joint_limit_constraint(
         .solve_mut(&mut jacobians.rows_mut(*j_id + ndofs, ndofs));
 
     let lhs = jacobians[dof_j_id + ndofs]; // = J^t * M^-1 J
-    let impulse_bounds = [
-        min_enabled as u32 as Real * -Real::MAX,
-        max_enabled as u32 as Real * Real::MAX,
-    ];
+    let impulse_bounds = if max_side {
+        [0.0, Real::MAX]
+    } else {
+        [-Real::MAX, 0.0]
+    };
     let cfm_gain = lhs * cfm_coeff;
 
     let constraint = GenericJointConstraint {
