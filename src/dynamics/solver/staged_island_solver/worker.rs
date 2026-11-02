@@ -1032,6 +1032,7 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
         if worker_id == 0 && ctx.has_multibodies {
             let vs = unsafe { &mut *ctx.velocity_solver };
             let multibodies = unsafe { &mut *ctx.multibodies };
+            let bodies = unsafe { &mut *ctx.bodies };
             for link in &vs.multibody_roots {
                 let multibody = multibodies
                     .get_multibody_mut_internal(link.multibody)
@@ -1040,6 +1041,10 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     .generic_solver_vels
                     .rows(multibody.solver_id as usize, multibody.ndofs());
                 multibody.velocities.copy_from(&solver_vels);
+                // The links' bodies end the step at these speeds as well:
+                // otherwise they keep the second-to-last substep's, which
+                // carry the push that corrected the pose.
+                multibody.update_velocities(bodies);
             }
         }
         // No sync after the multibody-velocity writeback: nothing follows, and
