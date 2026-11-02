@@ -7,10 +7,13 @@ use crate::dynamics::{IntegrationParameters, JointMotor, Multibody};
 use crate::math::{DVector, Real};
 
 /// How near its limit a coordinate takes the limit's row (rad, or m for a
-/// sliding axis). Within it the row stops the coordinate at the limit during
-/// the substep; built only once past the limit, a load resting the joint on
-/// it carries the joint past every other substep and the push back leaves a
-/// speed the pose never shows, which keeps the body awake.
+/// sliding axis), beyond the distance it would cover toward the limit within
+/// the substep at the speed it last moved: a joint resting on its limit keeps
+/// the row, and a fast one takes it before it can pass the limit. The row
+/// stops the coordinate at the limit during the substep; built only once
+/// past the limit, a load resting the joint on it carries the joint past
+/// every other substep and the push back leaves a speed the pose never
+/// shows, which keeps the body awake.
 const LIMIT_REACH: Real = 0.05;
 
 /// Initializes and generate the velocity constraints applicable to the multibody links attached
@@ -34,10 +37,12 @@ pub fn unit_joint_limit_constraint(
     let gaps = [curr_pos - limits[0], limits[1] - curr_pos];
     let max_side = gaps[1] < gaps[0];
     let gap = gaps[max_side as usize];
+    let speed = multibody.velocities[link.assembly_id + dof_id];
+    let toward = if max_side { speed } else { -speed };
 
-    // Far from both limits the row can push neither way: it keeps its slot
-    // and its share of the jacobians, but holds nothing to solve.
-    if gap >= LIMIT_REACH {
+    // Out of reach of both limits the row can push neither way: it keeps its
+    // slot and its share of the jacobians, but holds nothing to solve.
+    if gap >= LIMIT_REACH + toward.max(0.0) * params.dt {
         constraints[*insert_at] = GenericJointConstraint::inert(WritebackId::Limit(dof_id));
         *insert_at += 1;
         *j_id += 2 * ndofs;
