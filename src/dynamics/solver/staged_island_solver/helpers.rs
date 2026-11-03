@@ -1,6 +1,6 @@
 //! Staged-solver entry points on [`ContactConstraintsSet`] and
-//! [`VelocitySolver`]: generic (multibody) constraint init and the
-//! multibody-only halves of buffer init and position integration.
+//! [`VelocitySolver`]: generic (multibody) constraint placement and the
+//! multibody-only halves of init and position integration.
 
 use crate::dynamics::solver::SolverVel;
 use crate::dynamics::solver::VelocitySolver;
@@ -12,57 +12,50 @@ use crate::dynamics::solver::solver_contact_graph::SolverContactGraph;
 #[cfg(feature = "dim3")]
 use crate::dynamics::solver::velocity_solver::GyroParams;
 use crate::dynamics::{IntegrationParameters, MultibodyJointSet, RigidBodyHandle, RigidBodySet};
-use crate::math::DVector;
+use crate::math::{DVector, Real};
 use core::ops::Range;
 use parry::math::SIMD_WIDTH;
 
 use super::GroupLayout;
 
 impl ContactConstraintsSet {
-    /// Builds the generic (multibody) contact constraints for the staged solver.
-    pub(super) fn compute_generic_constraints(
+    /// Places the generic (multibody) contact constraints, each taking its jacobian entries in
+    /// turn, for the staged solver's workers to generate.
+    pub(super) fn place_generic_constraints(
         &mut self,
         bodies: &RigidBodySet,
         multibody_joints: &MultibodyJointSet,
         graph: &SolverContactGraph,
         store: &ManifoldStore,
-        jacobian_id: &mut usize,
     ) {
         let generic = graph.generic();
-        let total_num_constraints = generic.len();
-        self.generic_velocity_constraints_builder.resize(
-            total_num_constraints,
-            GenericContactConstraintBuilder::invalid(),
-        );
-        self.generic_velocity_constraints
-            .resize(total_num_constraints, GenericContactConstraint::invalid());
-
-        for (curr_id, r) in generic.iter().enumerate() {
-            let manifold = store.get(*r);
-            GenericContactConstraintBuilder::generate(
+        self.generic_velocity_constraints_builder
+            .resize(generic.len(), GenericContactConstraintBuilder::invalid());
+        (self.generic_velocity_constraints)
+            .resize(generic.len(), GenericContactConstraint::invalid());
+        let mut jacobian_id = 0;
+        for (r, constraint) in generic.iter().zip(&mut self.generic_velocity_constraints) {
+            constraint.place(
                 *r,
-                manifold,
+                store.get(*r),
                 bodies,
                 multibody_joints,
-                &mut self.generic_velocity_constraints_builder[curr_id],
-                &mut self.generic_velocity_constraints[curr_id],
-                &mut self.generic_jacobians,
-                jacobian_id,
+                &mut jacobian_id,
             );
         }
+        crate::dynamics::solver::grow_jacobians(&mut self.generic_jacobians, jacobian_id);
     }
 }
 
 impl VelocitySolver {
-    /// Initializes the solver buffers and multibody solver state, each multibody at the substep
-    /// of the group of its links; the plain rigid-body initialization is excluded, the staged
-    /// solver performs it in parallel in its first stage.
+    /// Initializes the solver buffers and gives each multibody its dofs, group by group; the
+    /// workers initialize the rigid bodies and the multibodies themselves (see
+    /// [`Self::init_multibody`]) in their first stages.
     pub(super) fn init_solver_buffers_and_multibodies(
         &mut self,
         groups: &mut [GroupLayout],
         island_bodies: &[RigidBodyHandle],
         num_awake_soft_mass_points: usize,
-        bodies: &mut RigidBodySet,
         multibodies: &mut MultibodyJointSet,
     ) {
         self.multibody_roots.clear();
@@ -111,28 +104,31 @@ impl VelocitySolver {
 
         self.generic_solver_vels_increment = DVector::zeros(multibody_solver_id as usize);
         self.generic_solver_vels = DVector::zeros(multibody_solver_id as usize);
+    }
 
-        for group in groups.iter() {
-            let dt = group.dt;
-            for link in &self.multibody_roots[group.multibody_roots.clone()] {
-                let multibody = multibodies
-                    .get_multibody_mut_internal(link.multibody)
-                    .unwrap();
-                multibody.update_velocities(bodies);
-                multibody.update_mass_matrix(dt, bodies);
-                multibody.update_acceleration(dt, bodies);
+    /// Initializes the multibody of `multibody_roots[root]` at the substep `dt` of its links'
+    /// group: its links' velocities, mass matrix and accelerations, and its solver velocities.
+    pub(super) fn init_multibody(
+        &mut self,
+        root: usize,
+        dt: Real,
+        bodies: &mut RigidBodySet,
+        multibodies: &mut MultibodyJointSet,
+    ) {
+        let multibody = multibodies
+            .get_multibody_mut_internal(self.multibody_roots[root].multibody)
+            .unwrap();
+        multibody.update_velocities(bodies);
+        multibody.update_mass_matrix(dt, bodies);
+        multibody.update_acceleration(dt, bodies);
 
-                let mut solver_vels_incr = self
-                    .generic_solver_vels_increment
-                    .rows_mut(multibody.solver_id as usize, multibody.ndofs());
-                let mut solver_vels = self
-                    .generic_solver_vels
-                    .rows_mut(multibody.solver_id as usize, multibody.ndofs());
-
-                solver_vels_incr.axpy(dt, &multibody.accelerations, 0.0);
-                solver_vels.copy_from(&multibody.velocities);
-            }
-        }
+        let (first, ndofs) = (multibody.solver_id as usize, multibody.ndofs());
+        (self.generic_solver_vels_increment.rows_mut(first, ndofs)).axpy(
+            dt,
+            &multibody.accelerations,
+            0.0,
+        );
+        (self.generic_solver_vels.rows_mut(first, ndofs)).copy_from(&multibody.velocities);
     }
 
     /// The multibody part of `integrate_positions` for one group's multibodies (`roots`, a range

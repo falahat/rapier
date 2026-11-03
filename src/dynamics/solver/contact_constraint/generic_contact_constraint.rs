@@ -1,5 +1,5 @@
 use crate::dynamics::solver::GenericRhs;
-use crate::dynamics::{IntegrationParameters, MultibodyJointSet, RigidBodySet};
+use crate::dynamics::{IntegrationParameters, Multibody, MultibodyJointSet, RigidBodySet};
 use crate::geometry::ContactManifold;
 #[cfg(feature = "dim3")]
 use crate::math::TangentImpulse;
@@ -32,15 +32,14 @@ impl GenericContactConstraintBuilder {
         }
     }
 
+    /// Generates the constraint of `manifold` where [`GenericContactConstraint::place`] placed it.
     pub fn generate(
-        manifold_id: ContactRef,
         manifold: &ContactManifold,
         bodies: &RigidBodySet,
         multibodies: &MultibodyJointSet,
         out_builder: &mut GenericContactConstraintBuilder,
         out_constraint: &mut GenericContactConstraint,
         jacobians: &mut DVector,
-        jacobian_id: &mut usize,
     ) {
         // TODO PERF: we haven’t tried to optimized this codepath yet (since it relies
         //            on multibodies which are already much slower than regular bodies).
@@ -68,35 +67,8 @@ impl GenericContactConstraintBuilder {
         };
         let (vels1, mprops1, type1) = (&rb1.vels, &rb1.mprops, effective_type(rb1));
         let (vels2, mprops2, type2) = (&rb2.vels, &rb2.mprops, effective_type(rb2));
-
-        // A multibody's fixed root behaves exactly like a regular fixed body.
-        // Thus, a contact against a fixed root must not reference the multibody's
-        // `solver_id`, because the multibody is only set up on the island owning
-        // its *dynamic* links.
-        let multibody1 = multibodies
-            .rigid_body_link(handle1)
-            .map(|m| (&multibodies[m.multibody], m.id))
-            .filter(|(mb, link_id)| (*link_id != 0 || mb.root_is_dynamic) && !rb1.is_sleeping());
-        let multibody2 = multibodies
-            .rigid_body_link(handle2)
-            .map(|m| (&multibodies[m.multibody], m.id))
-            .filter(|(mb, link_id)| (*link_id != 0 || mb.root_is_dynamic) && !rb2.is_sleeping());
-        let solver_vel1 =
-            multibody1
-                .map(|mb| mb.0.solver_id)
-                .unwrap_or(if type1.is_dynamic_or_kinematic() {
-                    rb1.ids.active_set_id
-                } else {
-                    u32::MAX
-                });
-        let solver_vel2 =
-            multibody2
-                .map(|mb| mb.0.solver_id)
-                .unwrap_or(if type2.is_dynamic_or_kinematic() {
-                    rb2.ids.active_set_id
-                } else {
-                    u32::MAX
-                });
+        let [(multibody1, solver_vel1), (multibody2, solver_vel2)] =
+            sides(manifold, bodies, multibodies);
         let force_dir1 = -manifold.data.normal;
 
         #[cfg(feature = "dim2")]
@@ -108,20 +80,8 @@ impl GenericContactConstraintBuilder {
             &vels2.linvel,
         );
 
-        let multibodies_ndof = multibody1.map(|m| m.0.ndofs()).unwrap_or(0)
-            + multibody2.map(|m| m.0.ndofs()).unwrap_or(0);
-        // For each solver contact we generate DIM constraints, and each constraints appends
-        // the multibodies jacobian and weighted jacobians
-        let required_jacobian_len =
-            *jacobian_id + manifold.data.solver_contacts.len() * multibodies_ndof * 2 * DIM;
-
-        // Grow the jacobian buffer to fit this constraint: `generate` runs serially in the
-        // staged solver's pre-phase (before any worker starts), so growing here is race-free
-        // (the old `!parallel` guard served the deleted parallel solver's shared buffer).
-        crate::dynamics::solver::grow_jacobians(jacobians, required_jacobian_len);
-
-        let chunk_j_id = *jacobian_id;
-
+        let mut jacobian_id = out_constraint.j_id;
+        let jacobian_id = &mut jacobian_id;
         let manifold_points = &manifold.data.solver_contacts;
         out_constraint.dir1 = force_dir1;
         out_constraint.im1 = if type1.is_dynamic_or_kinematic() {
@@ -134,9 +94,6 @@ impl GenericContactConstraintBuilder {
         } else {
             Vector::ZERO
         };
-        out_constraint.solver_vel1 = solver_vel1;
-        out_constraint.solver_vel2 = solver_vel2;
-        out_constraint.manifold_id = manifold_id;
         out_constraint.num_contacts = manifold_points.len() as u8;
         #[cfg(feature = "dim3")]
         {
@@ -372,21 +329,6 @@ impl GenericContactConstraintBuilder {
             out_constraint.manifold_contact_id[k] =
                 (manifold_point.contact_id[0] & !crate::geometry::NEW_CONTACT_BIT) as u8;
         }
-
-        let ndofs1 = multibody1.map(|mb| mb.0.ndofs()).unwrap_or(0);
-        let ndofs2 = multibody2.map(|mb| mb.0.ndofs()).unwrap_or(0);
-
-        // NOTE: we use the generic constraint for non-dynamic bodies because this will
-        //       reduce all ops to nothing because its ndofs will be zero.
-        let generic_constraint_mask = (multibody1.is_some() as u8)
-            | ((multibody2.is_some() as u8) << 1)
-            | (!type1.is_dynamic_or_kinematic() as u8)
-            | ((!type2.is_dynamic_or_kinematic() as u8) << 1);
-
-        out_constraint.j_id = chunk_j_id;
-        out_constraint.ndofs1 = ndofs1;
-        out_constraint.ndofs2 = ndofs2;
-        out_constraint.generic_constraint_mask = generic_constraint_mask;
     }
 
     pub fn update(
@@ -606,6 +548,32 @@ impl GenericContactConstraintBuilder {
     }
 }
 
+/// Each side's multibody link and solver velocity: a multibody's first dof, a solver body's slot,
+/// or `u32::MAX` for a side the constraint doesn't move. A multibody's fixed root acts as a fixed
+/// body, and a sleeping body or link (a frontier pair, under partial-island sleep) as a wall: the
+/// multibody is only set up on the island owning its dynamic links, and a sleeping body's ids
+/// belong to another island.
+fn sides<'a>(
+    manifold: &ContactManifold,
+    bodies: &RigidBodySet,
+    multibodies: &'a MultibodyJointSet,
+) -> [(Option<(&'a Multibody, usize)>, u32); 2] {
+    [manifold.data.rigid_body1, manifold.data.rigid_body2].map(|handle| {
+        let handle = handle.unwrap_or(RigidBodyHandle::invalid());
+        let rb = bodies.get(handle).unwrap_or(&bodies.default_fixed);
+        let link = (multibodies.rigid_body_link(handle))
+            .map(|m| (&multibodies[m.multibody], m.id))
+            .filter(|(mb, id)| (*id != 0 || mb.root_is_dynamic) && !rb.is_sleeping());
+        let moves = rb.body_type.is_dynamic_or_kinematic() && !rb.is_sleeping();
+        let vel = if moves {
+            rb.ids.active_set_id
+        } else {
+            u32::MAX
+        };
+        (link, link.map_or(vel, |(mb, _)| mb.solver_id))
+    })
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct GenericContactConstraint {
     /*
@@ -657,6 +625,32 @@ impl GenericContactConstraint {
             normal_part: [ContactConstraintNormalPart::zero(); MAX_MANIFOLD_POINTS],
             tangent_part: [ContactConstraintTangentPart::zero(); MAX_MANIFOLD_POINTS],
         }
+    }
+
+    /// Places the constraint of manifold `manifold_id`: the bodies it moves, and the jacobian
+    /// entries it takes from `jacobian_id` on (the staged solver places its generic contacts in
+    /// turn, then its workers generate them at once).
+    pub fn place(
+        &mut self,
+        manifold_id: ContactRef,
+        manifold: &ContactManifold,
+        bodies: &RigidBodySet,
+        multibodies: &MultibodyJointSet,
+        jacobian_id: &mut usize,
+    ) {
+        let [(link1, vel1), (link2, vel2)] = sides(manifold, bodies, multibodies);
+        let ndofs = |link: Option<(&Multibody, usize)>| link.map_or(0, |(mb, _)| mb.ndofs());
+        (self.ndofs1, self.ndofs2) = (ndofs(link1), ndofs(link2));
+        // NOTE: we use the generic constraint for non-dynamic bodies because this will
+        //       reduce all ops to nothing because its ndofs will be zero.
+        self.generic_constraint_mask = (link1.is_some() || vel1 == u32::MAX) as u8
+            | (((link2.is_some() || vel2 == u32::MAX) as u8) << 1);
+        (self.solver_vel1, self.solver_vel2) = (vel1, vel2);
+        self.manifold_id = manifold_id;
+        self.j_id = *jacobian_id;
+        // For each solver contact we generate DIM constraints, and each constraints appends
+        // the multibodies jacobian and weighted jacobians.
+        *jacobian_id += manifold.data.solver_contacts.len() * (self.ndofs1 + self.ndofs2) * 2 * DIM;
     }
 
     pub fn warmstart(

@@ -7,9 +7,11 @@ use core::sync::atomic::Ordering;
 #[cfg(feature = "dim3")]
 use crate::dynamics::rigid_body::gyroscopic_corrected_angvel;
 use crate::dynamics::solver::JointConstraintsSet;
-use crate::dynamics::solver::contact_constraint::ContactWithCoulombFrictionBuilder;
 #[cfg(feature = "dim3")]
 use crate::dynamics::solver::contact_constraint::ContactWithTwistFrictionBuilder;
+use crate::dynamics::solver::contact_constraint::{
+    ContactWithCoulombFrictionBuilder, GenericContactConstraintBuilder,
+};
 use crate::dynamics::solver::joint_constraint::GenericJointConstraintBuilder;
 use crate::dynamics::solver::solver_body::SOLVER_BODY_ALLOW_FAST_ROTATION;
 use crate::dynamics::solver::solver_contact_graph::ContactRef;
@@ -40,8 +42,8 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
 
     /*
      * Stage: initialize solver bodies and their velocity increments (parallel over
-     * claimed body slots; each writes solver-body slot i for island body i).
-     * Multibodies were initialized in the serial pre-phase.
+     * claimed body slots; each writes solver-body slot i for island body i). The multibodies'
+     * links are left to their own stage below.
      */
     {
         let all_fill_slots = 0..ctx.island_bodies.len();
@@ -187,6 +189,57 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
         // shared counter measurably throttle scalar builds (4x the chunks).
         sync.complete(stage, done, num_chunks);
         stage = sync.sync(stage, num_chunks);
+    }
+
+    /*
+     * Stage: initialize the multibodies, each at the substep of its links' group (parallel over
+     * them: each writes only its own links' bodies and its own dofs).
+     */
+    if ctx.has_multibodies {
+        let num_roots = unsafe { (*ctx.velocity_solver).multibody_roots.len() };
+        stage = spread(sync, stage, num_roots, worker_id, |root| {
+            // SAFETY: one worker per claimed multibody, which reads and writes only its own
+            // links, dofs and rigid bodies.
+            let vs = unsafe { &mut *ctx.velocity_solver };
+            let bodies = unsafe { &mut *ctx.bodies };
+            let multibodies = unsafe { &mut *ctx.multibodies };
+            let group = ctx
+                .groups
+                .iter()
+                .find(|g| g.multibody_roots.contains(&root));
+            let dt = group.map_or(ctx.groups[0].dt, |g| g.dt);
+            vs.init_multibody(root, dt, bodies, multibodies);
+        });
+    }
+
+    /*
+     * Stage: generate the generic (multibody) contact constraints (parallel over them: each
+     * writes only itself and the jacobian entries it was placed at).
+     */
+    {
+        let contacts = unsafe { &*ctx.contact_constraints };
+        let num_generic_contacts = contacts.generic_velocity_constraints.len();
+        if num_generic_contacts > 0 {
+            stage = spread(sync, stage, num_generic_contacts, worker_id, |i| {
+                // SAFETY: one worker per claimed constraint, reading the bodies the stages
+                // above initialized.
+                let contacts = unsafe { &mut *ctx.contact_constraints };
+                let builder = &mut contacts.generic_velocity_constraints_builder[i];
+                let constraint = &mut contacts.generic_velocity_constraints[i];
+                GenericContactConstraintBuilder::generate(
+                    ctx.store.get(constraint.manifold_id),
+                    unsafe { &*ctx.bodies },
+                    unsafe { &*ctx.multibodies },
+                    builder,
+                    constraint,
+                    &mut contacts.generic_jacobians,
+                );
+                // Published by the stage's completion, as the SIMD chunks' are.
+                if builder.has_bouncy_seed(constraint.num_contacts) {
+                    unsafe { &*ctx.any_bouncy }.store(true, Ordering::Relaxed);
+                }
+            });
+        }
     }
 
     /*
