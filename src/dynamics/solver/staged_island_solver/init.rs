@@ -607,7 +607,7 @@ impl StagedIslandSolver {
             .skip(1)
             .chain([num_rows]);
         let moved = |vel: u32, dofs: bool| {
-            (vel != u32::MAX).then_some(vel + if dofs { num_slots } else { 0 })
+            (vel != u32::MAX).then(|| vel + if dofs { num_slots } else { 0 })
         };
         self.generic_sets.assign(
             num_slots as usize + self.velocity_solver.generic_solver_vels.len(),
