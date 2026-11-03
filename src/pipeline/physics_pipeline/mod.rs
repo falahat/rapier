@@ -243,6 +243,9 @@ impl PhysicsPipeline {
                     events,
                 )
             };
+            if std::env::var_os("RAPIER_X_NOPOOL").is_some() {
+                return step();
+            }
             match pool {
                 Some(pool) => pool.install(step),
                 None => rayon::scope(|_| step()),

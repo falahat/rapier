@@ -88,7 +88,7 @@ impl PhysicsPipeline {
             // queue behind the `recv` waiting for it: deadlock. Hand those to the join
             // point instead, which runs them inline.
             #[cfg(feature = "parallel")]
-            if rayon::current_num_threads() > 1 {
+            if rayon::current_num_threads() > 1 && std::env::var_os("RAPIER_X_BVH_INLINE").is_none() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let mut task = task;
                 rayon::spawn(move || {
@@ -379,7 +379,7 @@ impl PhysicsPipeline {
         // `num_threads` = 1 and it runs inline, skipping all cross-worker coordination.
         if let Some(island_id) = islands.awake_island {
             #[cfg(feature = "parallel")]
-            let num_threads = rayon::current_num_threads();
+            let num_threads = std::env::var("RAPIER_X_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(rayon::current_num_threads);
             #[cfg(not(feature = "parallel"))]
             let num_threads = 1;
 

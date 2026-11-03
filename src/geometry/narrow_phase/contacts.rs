@@ -240,7 +240,8 @@ impl NarrowPhase {
 
             const BLOCK: usize = 64;
             #[allow(unused_mut)]
-            let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > BLOCK {
+            let broadcast_min = std::env::var("RAPIER_X_BCAST_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(BLOCK);
+            let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > broadcast_min {
                 let cursor = core::sync::atomic::AtomicUsize::new(0);
                 let candidates = &update_candidates[..];
                 let per_thread = rayon::broadcast(|_| {

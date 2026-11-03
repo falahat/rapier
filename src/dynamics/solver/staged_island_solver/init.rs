@@ -626,7 +626,7 @@ impl StagedIslandSolver {
         );
         // Avoid spawning more workers than there is work: each generic set is one.
         let num_workers =
-            num_workers.clamp(1, (approx_chunks / 16 + self.generic_sets.len()).max(1));
+            num_workers.clamp(1, (approx_chunks / 16 + self.generic_sets.len() / std::env::var("RAPIER_X_SETS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize)).max(1));
 
         #[cfg(feature = "dim3")]
         self.any_gyroscopic.store(false, Ordering::Relaxed);
