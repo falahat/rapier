@@ -273,7 +273,6 @@ impl StagedIslandSolver {
             + (soft.scalar_constraints.len() + soft.shape_constraints.len() + soft.contacts.len())
                 / 8
             + fem_chunks;
-        let num_workers = num_workers.clamp(1, (approx_chunks / 16).max(1));
 
         // Joints: colored like contacts and laid out color by color (scalar
         // constraints only). Colors too small to parallelize plus the generic
@@ -583,7 +582,7 @@ impl StagedIslandSolver {
             }
         }
 
-        // Generic (multibody) contact constraints: serial init, solved by worker 0.
+        // Generic (multibody) contact constraints: serial init, solved set by set.
         let mut jacobian_id = 0;
         set.compute_generic_constraints(bodies, multibodies, graph, store, &mut jacobian_id);
         self.generic_groups.assign(
@@ -595,6 +594,39 @@ impl StagedIslandSolver {
             &self.joint_constraints,
             multibodies,
         );
+        // A generic constraint moves a solver body's slot, or a jointed body's dofs (counted
+        // from its first, after every slot).
+        let num_slots = self.velocity_solver.solver_bodies.len() as u32;
+        let joints = &self.joint_constraints;
+        let firsts = (joints.generic_velocity_constraints_builder.iter())
+            .filter_map(|b| Some((b.link_and_first_row()?.1, b.moved(multibodies, num_slots))));
+        let num_rows = joints.generic_velocity_constraints.len();
+        let ends = firsts
+            .clone()
+            .map(|(first, _)| first)
+            .skip(1)
+            .chain([num_rows]);
+        let moved = |vel: u32, dofs: bool| {
+            (vel != u32::MAX).then_some(vel + if dofs { num_slots } else { 0 })
+        };
+        self.generic_sets.assign(
+            num_slots as usize + self.velocity_solver.generic_solver_vels.len(),
+            set.generic_velocity_constraints.iter().map(|c| {
+                let mask = c.generic_constraint_mask;
+                [
+                    moved(c.solver_vel1, mask & 0b01 != 0),
+                    moved(c.solver_vel2, mask & 0b10 != 0),
+                ]
+            }),
+            // A builder's rows run up to the next builder's first (the rows themselves are only
+            // filled by the builders' updates).
+            firsts
+                .zip(ends)
+                .map(|((first, moved), end)| (first..end, moved)),
+        );
+        // Avoid spawning more workers than there is work: each generic set is one.
+        let num_workers =
+            num_workers.clamp(1, (approx_chunks / 16 + self.generic_sets.len()).max(1));
 
         #[cfg(feature = "dim3")]
         self.any_gyroscopic.store(false, Ordering::Relaxed);
@@ -635,6 +667,7 @@ impl StagedIslandSolver {
             num_chunks,
             groups: &self.groups,
             generic_groups: &self.generic_groups,
+            generic_sets: &self.generic_sets,
             color_ranges: &self.color_ranges,
             joint_color_ranges: &self.joint_color_ranges,
             joint_rows: &self.joint_rows,

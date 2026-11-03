@@ -1,6 +1,7 @@
 //! Intra-island parallel solver: contacts are colored so same-color
 //! constraints touch pairwise-disjoint bodies (SIMD-packed per color); persistent workers claim
-//! batches between spin-barrier stages; joints/multibody solve in worker-0-exclusive stages.
+//! batches between spin-barrier stages; the uncolored joints solve in worker-0-exclusive stages,
+//! the multibodies and their constraints in body-disjoint sets (see `GenericSets`).
 //! Deterministic: results depend only on the coloring, not on batch distribution.
 
 mod helpers;
@@ -56,6 +57,27 @@ const LAYOUT_REF_WORKERS: usize = 8;
 /// stage-tail imbalance. The stealing in [`StageSync::claim`] keeps the tail at one batch.
 fn stage_batch(domain_len: usize, num_workers: usize) -> usize {
     (domain_len / (num_workers * 8)).clamp(CHUNK_BATCH, 64)
+}
+
+/// A stage spreading `units` units of work over the workers: `work` runs on each unit this
+/// worker claims, then the worker waits for the stage to end. Returns the next stage.
+fn spread(
+    sync: &StageSync,
+    stage: usize,
+    units: usize,
+    worker_id: usize,
+    mut work: impl FnMut(usize),
+) -> usize {
+    let all = 0..units;
+    let mut done = 0;
+    while let Some(claimed) =
+        sync.claim(stage, &all, stage_batch(units, sync.num_workers), worker_id)
+    {
+        done += claimed.len();
+        claimed.for_each(&mut work);
+    }
+    sync.complete(stage, done, units);
+    sync.sync(stage, units)
 }
 
 /// One contiguous run of SIMD chunks over a slice of solver-manifold refs (a persistent color
@@ -212,6 +234,100 @@ impl GenericGroups {
     }
 }
 
+/// The island's generic (multibody) constraints in sets that move no body in common, so that
+/// the workers solve different sets at once. A set keeps its constraints in order, so the sets
+/// reach what one worker solving every constraint in turn reaches.
+#[derive(Clone, Default)]
+struct GenericSets {
+    /// Each generic contact constraint's set and index, by set then index.
+    contacts: Vec<(u32, u32)>,
+    /// Each generic joint row's set and index, likewise.
+    joint_rows: Vec<(u32, u32)>,
+    /// Where each set's contacts and joint rows start, then where the last set's end.
+    starts: Vec<[usize; 2]>,
+    /// Workspace: the parents of a union-find over the bodies the constraints move.
+    parents: Vec<u32>,
+}
+
+impl GenericSets {
+    fn len(&self) -> usize {
+        self.starts.len().saturating_sub(1)
+    }
+
+    /// The generic contact constraints of `set`, in order.
+    fn contacts(&self, set: usize) -> impl Iterator<Item = usize> + '_ {
+        let all = &self.contacts[self.starts[set][0]..self.starts[set + 1][0]];
+        all.iter().map(|(_, i)| *i as usize)
+    }
+
+    /// The generic joint rows of `set`, in order.
+    fn joint_rows(&self, set: usize) -> impl Iterator<Item = usize> + '_ {
+        let all = &self.joint_rows[self.starts[set][1]..self.starts[set + 1][1]];
+        all.iter().map(|(_, i)| *i as usize)
+    }
+
+    /// Sorts the generic constraints into sets, given the two bodies each contact and each run
+    /// of joint rows moves among `num_bodies` (`None` for a side it doesn't move).
+    fn assign(
+        &mut self,
+        num_bodies: usize,
+        contacts: impl Iterator<Item = [Option<u32>; 2]> + Clone,
+        joint_rows: impl Iterator<Item = (Range<usize>, [Option<u32>; 2])> + Clone,
+    ) {
+        fn root(parents: &mut [u32], mut body: u32) -> u32 {
+            while parents[body as usize] != body {
+                parents[body as usize] = parents[parents[body as usize] as usize];
+                body = parents[body as usize];
+            }
+            body
+        }
+        let parents = &mut self.parents;
+        parents.clear();
+        parents.extend(0..num_bodies as u32);
+        for sides in contacts
+            .clone()
+            .chain(joint_rows.clone().map(|(_, sides)| sides))
+        {
+            if let [Some(a), Some(b)] = sides {
+                let (a, b) = (root(parents, a), root(parents, b));
+                parents[a.max(b) as usize] = a.min(b);
+            }
+        }
+        // A constraint's set is its bodies' root (one that moves none goes last).
+        let mut set_of =
+            |[a, b]: [Option<u32>; 2]| a.or(b).map_or(u32::MAX, |body| root(parents, body));
+        self.contacts.clear();
+        (self.contacts).extend(
+            contacts
+                .enumerate()
+                .map(|(i, sides)| (set_of(sides), i as u32)),
+        );
+        self.contacts.sort_unstable();
+        self.joint_rows.clear();
+        for (rows, sides) in joint_rows {
+            let set = set_of(sides);
+            self.joint_rows.extend(rows.map(|row| (set, row as u32)));
+        }
+        self.joint_rows.sort_unstable();
+        self.starts.clear();
+        let set_at = |list: &[(u32, u32)], at: usize| list.get(at).map(|(set, _)| *set);
+        let (mut c, mut j) = (0, 0);
+        while let Some(set) = (set_at(&self.contacts, c).into_iter())
+            .chain(set_at(&self.joint_rows, j))
+            .min()
+        {
+            self.starts.push([c, j]);
+            while set_at(&self.contacts, c) == Some(set) {
+                c += 1;
+            }
+            while set_at(&self.joint_rows, j) == Some(set) {
+                j += 1;
+            }
+        }
+        self.starts.push([c, j]);
+    }
+}
+
 /// Per-group slices of the staged joint layout, persisted alongside the
 /// joint-assembly cache (`staged_joints_valid`) so a reused layout can refill
 /// the per-step [`GroupLayout`]s.
@@ -229,7 +345,7 @@ struct GroupJointRanges {
 
 /// State shared between solver workers. Safety: the raw pointers are dereferenced by multiple
 /// workers, sound only under [`run_worker`]'s stage/color discipline — slots reached only via
-/// claimed indices, same-color body writes disjoint, worker 0 alone mutates joints/bodies/multibodies.
+/// claimed indices, same-color and same-set body writes disjoint, each multibody claimed whole.
 struct SharedCtx<'a> {
     sync: &'a StageSync,
     /// The SIMD chunk layout as segments over the persistent bucket slices (and
@@ -240,6 +356,7 @@ struct SharedCtx<'a> {
     /// Always at least one entry; exactly one on the ungrouped fast path.
     groups: &'a [GroupLayout],
     generic_groups: &'a GenericGroups,
+    generic_sets: &'a GenericSets,
     color_ranges: &'a [(u8, Range<usize>)],
     joint_color_ranges: &'a [(u8, Range<usize>)],
     joint_rows: &'a [Range<usize>],
@@ -318,6 +435,7 @@ pub(crate) struct StagedIslandSolver {
     /// single spanning entry on the ungrouped fast path.
     groups: Vec<GroupLayout>,
     generic_groups: GenericGroups,
+    generic_sets: GenericSets,
     /// Stable storage for the multi-group chunk refs: per-(group, color)
     /// contiguous copies of the persistent buckets' refs (the single-group
     /// path points straight into the buckets and never fills this).
@@ -391,6 +509,7 @@ impl StagedIslandSolver {
             color_ranges: Vec::new(),
             groups: Vec::new(),
             generic_groups: GenericGroups::default(),
+            generic_sets: GenericSets::default(),
             grouped_chunk_refs: Vec::new(),
             overflow_workspace: Vec::new(),
             joint_colors: ParallelInteractionGroups::new(),

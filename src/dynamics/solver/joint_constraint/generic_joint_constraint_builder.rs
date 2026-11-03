@@ -59,6 +59,26 @@ impl GenericJointConstraintBuilder {
             Self::Empty => None,
         }
     }
+
+    /// The bodies this builder's rows move: a solver body's slot, or a multibody's first dof
+    /// counted after `num_slots` slots (`None` for a side it doesn't move).
+    pub(crate) fn moved(
+        &self,
+        multibodies: &MultibodyJointSet,
+        num_slots: u32,
+    ) -> [Option<u32>; 2] {
+        let dofs = |link: MultibodyLinkId| num_slots + multibodies[link.multibody].solver_id;
+        let side = |side: LinkOrBody| match side {
+            LinkOrBody::Link(link) => Some(dofs(link)),
+            LinkOrBody::Body(slot) => Some(slot),
+            LinkOrBody::Fixed => None,
+        };
+        match self {
+            Self::Internal(b) => [Some(dofs(b.link)), None],
+            Self::External(b) => [side(b.link1), side(b.link2)],
+            Self::Empty => [None, None],
+        }
+    }
 }
 
 #[derive(Copy, Clone)]

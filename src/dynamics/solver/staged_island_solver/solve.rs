@@ -1,15 +1,15 @@
-//! One solve pass of a substep: soft-body prepare, joint colors, worker-0 joint overflow,
-//! soft-body colors/shape constraints/serial constraints, contact colors, then the worker-0 contact
-//! overflow (all completion-gated stages).
+//! One solve pass of a substep: soft-body prepare, joint colors, worker-0 joint overflow, the
+//! generic joints set by set, soft-body colors/shape constraints/serial constraints, contact
+//! colors, the worker-0 contact overflow, then the generic contacts set by set (all
+//! completion-gated stages).
 
 use crate::dynamics::IntegrationParameters;
-use crate::dynamics::solver::JointConstraintsSet;
 use crate::math::Real;
 
-use super::{GenericGroups, SharedCtx, stage_batch};
+use super::{GenericGroups, SharedCtx, spread, stage_batch};
 
-/// One solve pass: joints (colored, then overflow + generic on worker 0), soft-body rows, then
-/// contact colors (parallel); returns the updated stage ordinal. `soft_update` updates the soft
+/// One solve pass: joints (colored, then overflow on worker 0, then generic set by set),
+/// soft-body rows, then contacts likewise; returns the updated stage ordinal. `soft_update` updates the soft
 /// constraints from the poses first; `soft_warmstart` is `Some(coefficient)` to warm-start them.
 pub(super) unsafe fn solve_pass(
     ctx: &SharedCtx,
@@ -199,10 +199,10 @@ pub(super) unsafe fn solve_pass(
         stage = sync.sync(stage, virt.end);
     }
 
-    // Overflow + generic joints and soft-body particle attachments, solved exclusively by
-    // worker 0 (they write body velocities, so no other worker may access solver bodies
-    // concurrently: they wait at the barrier). Skipped entirely when empty (the jointless case).
-    if !group.joint_overflow.is_empty() || has_generic_joints || has_attachments {
+    // Overflow joints and soft-body particle attachments, solved exclusively by worker 0 (they
+    // write body velocities, so no other worker may access solver bodies concurrently: they
+    // wait at the barrier). Skipped entirely when empty (the jointless case).
+    if !group.joint_overflow.is_empty() || has_attachments {
         if worker_id == 0 {
             for joint_id in group.joint_overflow.clone() {
                 solve_joint(joint_id);
@@ -219,32 +219,32 @@ pub(super) unsafe fn solve_pass(
                     soft_warmstart,
                 );
             }
-
-            if has_generic_joints {
-                let joints = unsafe { &mut *ctx.joint_constraints };
-                let vs = unsafe { &mut *ctx.velocity_solver };
-                let JointConstraintsSet {
-                    generic_jacobians,
-                    generic_velocity_constraints,
-                    ..
-                } = joints;
-                for (i, c) in generic_velocity_constraints.iter_mut().enumerate() {
-                    if !GenericGroups::holds(&ctx.generic_groups.joint_rows, i, group_index) {
-                        continue;
-                    }
-                    if wo_bias {
-                        c.remove_bias_from_rhs();
-                    }
-                    c.solve(
-                        generic_jacobians,
-                        &mut vs.solver_bodies,
-                        &mut vs.generic_solver_vels,
-                    );
-                }
-            }
             sync.complete(stage, 1, 1);
         }
         stage = sync.sync(stage, 1);
+    }
+
+    // Generic (multibody) joints, set by set.
+    if has_generic_joints {
+        stage = spread(sync, stage, ctx.generic_sets.len(), worker_id, |set| {
+            // SAFETY: the sets move pairwise-disjoint bodies.
+            let joints = unsafe { &mut *ctx.joint_constraints };
+            let vs = unsafe { &mut *ctx.velocity_solver };
+            for i in ctx.generic_sets.joint_rows(set) {
+                if !GenericGroups::holds(&ctx.generic_groups.joint_rows, i, group_index) {
+                    continue;
+                }
+                let c = &mut joints.generic_velocity_constraints[i];
+                if wo_bias {
+                    c.remove_bias_from_rhs();
+                }
+                c.solve(
+                    &joints.generic_jacobians,
+                    &mut vs.solver_bodies,
+                    &mut vs.generic_solver_vels,
+                );
+            }
+        });
     }
 
     /*
@@ -317,8 +317,8 @@ pub(super) unsafe fn solve_pass(
         }
     }
 
-    // Overflow + generic contacts, solved exclusively by worker 0. Unlike the
-    // joint overflow stage this one is unconditional: it doubles as the pass'
+    // Overflow contacts, solved exclusively by worker 0. Unlike the joint
+    // overflow stage this one is unconditional: it doubles as the pass'
     // trailing barrier so every worker leaves solve_pass in lockstep.
     if worker_id == 0 {
         for chunk_id in group.overflow.clone() {
@@ -340,30 +340,34 @@ pub(super) unsafe fn solve_pass(
                 );
             }
         }
+        sync.complete(stage, 1, 1);
+    }
+    stage = sync.sync(stage, 1);
 
-        if has_generic_contacts {
+    // Generic (multibody) contacts, set by set.
+    if has_generic_contacts {
+        stage = spread(sync, stage, ctx.generic_sets.len(), worker_id, |set| {
+            // SAFETY: the sets move pairwise-disjoint bodies.
             let contacts = unsafe { &mut *ctx.contact_constraints };
             let vs = unsafe { &mut *ctx.velocity_solver };
-            let jac = &contacts.generic_jacobians;
-            for (i, c) in contacts.generic_velocity_constraints.iter_mut().enumerate() {
+            for i in ctx.generic_sets.contacts(set) {
                 if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
                     continue;
                 }
+                let c = &mut contacts.generic_velocity_constraints[i];
                 if wo_bias {
                     c.remove_cfm_and_bias_from_rhs();
                 }
                 c.solve(
-                    jac,
+                    &contacts.generic_jacobians,
                     &mut vs.solver_bodies,
                     &mut vs.generic_solver_vels,
                     true,
                     solve_friction,
                 );
             }
-        }
-        sync.complete(stage, 1, 1);
+        });
     }
-    stage = sync.sync(stage, 1);
 
     if has_soft && ctx.base_params.soft_bodies.resweep_strain < Real::MAX {
         // Second sweep of the strained soft constraints after the contacts (already updated and
