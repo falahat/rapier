@@ -220,10 +220,13 @@ impl PhysicsPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
-        // With a dedicated pool configured, run the whole step inside it.
+        // Run the whole step on a worker of its pool, the dedicated one or the caller's: its
+        // parallel loops then start from inside the pool, rather than each waking it from
+        // outside (a small step's loops run where they are).
         #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
-        if let Some(pool) = self.thread_pool.clone() {
-            return pool.install(|| {
+        {
+            let pool = self.thread_pool.clone();
+            let mut step = || {
                 self.step_inner(
                     gravity,
                     integration_parameters,
@@ -239,9 +242,14 @@ impl PhysicsPipeline {
                     hooks,
                     events,
                 )
-            });
+            };
+            match pool {
+                Some(pool) => pool.install(step),
+                None => rayon::scope(|_| step()),
+            }
         }
 
+        #[cfg(not(all(feature = "parallel", not(feature = "unsync-callbacks"))))]
         self.step_inner(
             gravity,
             integration_parameters,
