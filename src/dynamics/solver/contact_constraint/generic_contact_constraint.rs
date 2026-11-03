@@ -118,9 +118,7 @@ impl GenericContactConstraintBuilder {
         // Grow the jacobian buffer to fit this constraint: `generate` runs serially in the
         // staged solver's pre-phase (before any worker starts), so growing here is race-free
         // (the old `!parallel` guard served the deleted parallel solver's shared buffer).
-        if jacobians.nrows() < required_jacobian_len {
-            jacobians.resize_vertically_mut(required_jacobian_len, 0.0);
-        }
+        crate::dynamics::solver::grow_jacobians(jacobians, required_jacobian_len);
 
         let chunk_j_id = *jacobian_id;
 

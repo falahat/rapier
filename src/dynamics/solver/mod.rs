@@ -1,5 +1,6 @@
 use self::velocity_solver::VelocitySolver;
 use crate::alloc_prelude::*;
+use crate::math::DVector;
 
 use contact_constraint::*;
 pub(crate) use joint_constraint::MotorParameters;
@@ -45,6 +46,16 @@ pub unsafe fn reset_buffer_reusing<T>(buffer: &mut Vec<T>, len: usize) {
                 .write_bytes(0, len - old_len);
             buffer.set_len(len);
         }
+    }
+}
+
+/// Grows the multibody constraints' shared `jacobians` to hold at least `len` entries, at
+/// least doubling them when they must grow: constraints claim their entries one after another,
+/// and growing to each claim exactly copied the whole list for every constraint (a thousand
+/// jointed ragdolls copied 25 billion entries filling theirs).
+pub(crate) fn grow_jacobians(jacobians: &mut DVector, len: usize) {
+    if jacobians.nrows() < len {
+        jacobians.resize_vertically_mut(len.max(2 * jacobians.nrows()), 0.0);
     }
 }
 

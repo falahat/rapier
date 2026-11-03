@@ -143,11 +143,8 @@ impl JointGenericExternalConstraintBuilder {
         *j_id += multibodies_ndof * 2 * num_rows;
 
         // Grow the jacobian buffer to fit this constraint: runs serially in the staged solver's
-        // pre-phase, so race-free (see `generic_contact_constraint`); the internal-constraint
-        // `generate` below already resizes unconditionally.
-        if jacobians.nrows() < required_jacobian_len {
-            jacobians.resize_vertically_mut(required_jacobian_len, 0.0);
-        }
+        // pre-phase, so race-free (see `generic_contact_constraint`).
+        crate::dynamics::solver::grow_jacobians(jacobians, required_jacobian_len);
 
         let mut joint_data = masked_data;
         // NOTE: multibody links are positioned by `link.local_to_world` which is
@@ -313,9 +310,7 @@ impl JointGenericInternalConstraintBuilder {
         });
 
         *j_id += num_constraints * multibody.ndofs() * 2;
-        if jacobians.nrows() < *j_id {
-            jacobians.resize_vertically_mut(*j_id, 0.0);
-        }
+        crate::dynamics::solver::grow_jacobians(jacobians, *j_id);
 
         *out_constraint_id += num_constraints;
     }
