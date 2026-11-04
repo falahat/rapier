@@ -1,6 +1,8 @@
 //! Substep solve groups: the awake set partitioned by effective `additional_solver_iterations`
 //! and `additional_pgs_iterations` (max over each awake connected component), grouped by count
 //! into contiguous ranges. Applied (reorder, re-stamp, epoch bump) only when not already grouped.
+//! With `parallel-groups`, each touching set of jointed bodies that nothing else is solved
+//! against is a group of its own, solved beside the others.
 
 use super::IslandManager;
 use crate::data::union_find::UnionFind;
@@ -25,6 +27,9 @@ pub(crate) struct SolveGroup {
     /// Extra internal PGS iterations per substep for this group, on top of
     /// `IntegrationParameters::num_internal_pgs_iterations`.
     pub extra_pgs: u32,
+    /// Whether the group is one touching set of jointed bodies alone: it shares no body,
+    /// contact or joint with any other group, so it can be solved beside them.
+    pub separate: bool,
 }
 
 /// The partition key of a body: its extra substeps in the high half, its extra PGS iterations
@@ -33,6 +38,11 @@ pub(crate) struct SolveGroup {
 fn key(extra_substeps: u32, extra_pgs: u32) -> u32 {
     (extra_substeps.min(0xFFFF) << 16) | extra_pgs.min(0xFFFF)
 }
+
+/// A body that is a jointed body's link, and one coupled to a kinematic or soft body:
+/// marks a touching set takes from its bodies (see [`SubstepGroupsWorkspace::marks`]).
+const JOINTED: u8 = 1;
+const SHARED: u8 = 2;
 
 /// The element-wise maximum of two keys (a component takes the largest of each count).
 #[inline]
@@ -48,10 +58,15 @@ pub(crate) struct SubstepGroupsWorkspace {
     uf: UnionFind,
     /// Effective key per awake body slot (component max of each count, see `key`).
     keys: Vec<u32>,
-    /// Distinct keys in use, sorted descending.
-    distinct: Vec<u32>,
-    /// Scatter cursors/counts per distinct key.
-    offsets: Vec<usize>,
+    /// Touching-set rank per awake body slot: its component's root slot plus one for a
+    /// separate set (see [`SolveGroup::separate`]), 0 for every other body.
+    ranks: Vec<u32>,
+    /// [`JOINTED`] and [`SHARED`] marks per awake body slot, then OR-ed per component root.
+    marks: Vec<u8>,
+    sets: Vec<u8>,
+    /// The reorder's permutation, and a scratch buffer to apply it to the keys and ranks.
+    order: Vec<u32>,
+    scratch: Vec<u32>,
     /// Reorder workspace for the awake `bodies` vec.
     workspace: Vec<RigidBodyHandle>,
 }
@@ -71,7 +86,11 @@ impl IslandManager {
         soft_bodies: &SoftBodySet,
     ) {
         self.solve_groups.clear();
-        if !any_extra {
+        // Touching sets are worth setting apart only where they are solved side by side, and
+        // only with two jointed bodies to set apart.
+        let split =
+            cfg!(feature = "parallel-groups") && multibody_joints.multibodies().nth(1).is_some();
+        if !any_extra && !split {
             return;
         }
         let Some(awake_id) = self.awake_island else {
@@ -81,6 +100,8 @@ impl IslandManager {
 
         let ws = &mut self.substep_groups_workspace;
         ws.uf.reset(num_bodies);
+        ws.marks.clear();
+        ws.marks.resize(num_bodies, 0);
 
         // An edge merges components only between awake *dynamic* bodies: fixed/kinematic bodies
         // are not solver DOFs and must not glue unrelated components (a kinematic platform would
@@ -136,6 +157,7 @@ impl IslandManager {
             let Some(root) = slot(sb.root_body()) else {
                 continue;
             };
+            ws.marks[root as usize] |= SHARED;
             for attachment in sb.particle_attachments() {
                 if let Some(s) = slot(attachment.body) {
                     ws.uf.union(root, s);
@@ -182,6 +204,7 @@ impl IslandManager {
         let lift = |ws: &mut SubstepGroupsWorkspace, h1, h2| {
             if let (Some(k), Some(d)) = (kinematic_slot(h1), slot(h2)) {
                 ws.keys[k as usize] = ws.keys[k as usize].max(ws.keys[d as usize]);
+                ws.marks[d as usize] |= SHARED;
             }
         };
         for pair in narrow_phase.contact_pairs() {
@@ -198,60 +221,72 @@ impl IslandManager {
             lift(ws, joint.body2, joint.body1);
         }
 
-        // Fast path: the list is already grouped (keys non-increasing along the
-        // vec). Steady-state elevated scenes take this branch every step; only
-        // derive the ranges, no reorder, no epoch bump.
-        if ws.keys.is_sorted_by(|a, b| a >= b) {
-            push_group_ranges(&mut self.solve_groups, &ws.keys);
+        // A touching set that holds a jointed body, and no kinematic or soft body, is a group of
+        // its own: nothing else is solved against it, so it can be solved beside the rest. Its
+        // bodies take its root slot plus one as their rank, every other body 0, and the groups
+        // follow the keys, then the ranks.
+        ws.ranks.clear();
+        ws.ranks.resize(num_bodies, 0);
+        if split {
+            for multibody in multibody_joints.multibodies() {
+                if let Some(s) = (multibody.links()).find_map(|link| slot(link.rigid_body_handle()))
+                {
+                    ws.marks[s as usize] |= JOINTED;
+                }
+            }
+            ws.sets.clear();
+            ws.sets.resize(num_bodies, 0);
+            for i in 0..num_bodies {
+                let root = ws.uf.find(i as u32) as usize;
+                ws.sets[root] |= ws.marks[i];
+            }
+            for i in 0..num_bodies {
+                let root = ws.uf.find(i as u32);
+                if ws.sets[root as usize] == JOINTED {
+                    ws.ranks[i] = root + 1;
+                }
+            }
+        }
+        let place =
+            |ws: &SubstepGroupsWorkspace, i: usize| (core::cmp::Reverse(ws.keys[i]), ws.ranks[i]);
+
+        // Fast path: the list is already grouped (keys non-increasing along the vec, ranks
+        // non-decreasing within a key). Steady-state elevated scenes take this branch every
+        // step; only derive the ranges, no reorder, no epoch bump.
+        if (1..num_bodies).all(|i| place(ws, i - 1) <= place(ws, i)) {
+            push_group_ranges(&mut self.solve_groups, &ws.keys, &ws.ranks);
             return;
         }
 
-        // Reorder: stable counting sort by key, descending. Distinct keys are
-        // few (one per elevation level in use), so the "find ordinal" scans are
-        // effectively O(1).
-        ws.distinct.clear();
-        for &k in &ws.keys {
-            if !ws.distinct.contains(&k) {
-                ws.distinct.push(k);
-            }
-        }
-        ws.distinct.sort_unstable_by(|a, b| b.cmp(a));
-
-        ws.offsets.clear();
-        ws.offsets.resize(ws.distinct.len(), 0);
-        for &k in &ws.keys {
-            let ord = ws.distinct.iter().position(|&d| d == k).unwrap();
-            ws.offsets[ord] += 1;
-        }
-        let mut start = 0;
-        for count in &mut ws.offsets {
-            let c = *count;
-            *count = start;
-            start += c;
-        }
-
+        // Reorder: a stable sort by key, descending, then by touching set.
+        ws.order.clear();
+        ws.order.extend(0..num_bodies as u32);
+        (ws.order).sort_by_key(|&i| {
+            (
+                core::cmp::Reverse(ws.keys[i as usize]),
+                ws.ranks[i as usize],
+            )
+        });
         let island_bodies = &mut self.islands[awake_id].bodies;
         ws.workspace.clear();
-        ws.workspace.resize(num_bodies, RigidBodyHandle::invalid());
-        for (i, &handle) in island_bodies.iter().enumerate() {
-            let ord = ws.distinct.iter().position(|&d| d == ws.keys[i]).unwrap();
-            ws.workspace[ws.offsets[ord]] = handle;
-            ws.offsets[ord] += 1;
-        }
+        (ws.workspace).extend(ws.order.iter().map(|&i| island_bodies[i as usize]));
         core::mem::swap(island_bodies, &mut ws.workspace);
+        for list in [&mut ws.keys, &mut ws.ranks] {
+            ws.scratch.clear();
+            (ws.scratch).extend(ws.order.iter().map(|&i| list[i as usize]));
+            core::mem::swap(list, &mut ws.scratch);
+        }
 
-        // Re-stamp the invariant `active_set_id == index in bodies`, re-derive
-        // the (now sorted) keys, and invalidate every ordering-derived cache.
+        // Re-stamp the invariant `active_set_id == index in bodies`, and invalidate every
+        // ordering-derived cache.
         for (i, handle) in self.islands[awake_id].bodies.iter().enumerate() {
             bodies.index_mut_internal(*handle).ids.active_set_id = i as u32;
         }
-        ws.keys.sort_unstable_by(|a, b| b.cmp(a));
-        push_group_ranges(&mut self.solve_groups, &ws.keys);
+        push_group_ranges(&mut self.solve_groups, &ws.keys, &ws.ranks);
         self.bump_active_set_epoch();
     }
 }
 
-/// Derives contiguous group ranges from a descending-sorted key sequence.
 /// The two bodies a touching pair couples: its first manifold's, or the colliders' parents
 /// for a pair of two soft surfaces.
 fn pair_bodies(
@@ -267,14 +302,17 @@ fn pair_bodies(
     }
 }
 
-fn push_group_ranges(groups: &mut Vec<SolveGroup>, keys: &[u32]) {
+/// Derives contiguous group ranges from a descending-sorted key sequence and the bodies'
+/// touching-set ranks: a group per run of one key and one rank.
+fn push_group_ranges(groups: &mut Vec<SolveGroup>, keys: &[u32], ranks: &[u32]) {
     let mut start = 0;
     for i in 1..=keys.len() {
-        if i == keys.len() || keys[i] != keys[start] {
+        if i == keys.len() || keys[i] != keys[start] || ranks[i] != ranks[start] {
             groups.push(SolveGroup {
                 body_range: start..i,
                 extra_iters: keys[start] >> 16,
                 extra_pgs: keys[start] & 0xFFFF,
+                separate: ranks[start] > 0,
             });
             start = i;
         }

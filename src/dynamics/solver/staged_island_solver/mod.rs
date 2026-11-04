@@ -147,6 +147,9 @@ struct GroupLayout {
     multibody_roots: Range<usize>,
     /// Their degrees of freedom, a row range of the generic solver velocities.
     multibody_dofs: Range<usize>,
+    /// Whether the group shares no body or constraint with any other group (see
+    /// `SolveGroup::separate`), so it can be solved beside them.
+    separate: bool,
 }
 
 /// The solve group of each generic (multibody) constraint, so that a group

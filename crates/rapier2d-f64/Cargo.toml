@@ -58,6 +58,10 @@ std = [
 # default: it adds per-body solver state and is still experimental.
 fem = []
 parallel = ["dep:rayon", "std", "parry2d-f64/parallel"]
+# Solves the separate touching sets of jointed bodies side by side on rayon's pool,
+# where the staged solver otherwise solves them one after another; unlike
+# `parallel`, it splits no set's own work across workers.
+parallel-groups = ["dep:rayon", "std"]
 # Drops the `Sync` requirement from callbacks (`PhysicsHooks`, `EventHandler`).
 # As a side effect, this also removes the dedicated threadpool API from the physics world
 # and pipeline.

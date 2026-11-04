@@ -92,6 +92,7 @@ impl StagedIslandSolver {
                     dt: base_params.dt / num_substeps as Real,
                     multibody_roots: 0..0,
                     multibody_dofs: 0..0,
+                    separate: group.separate,
                 });
             }
         } else {
@@ -112,6 +113,7 @@ impl StagedIslandSolver {
                 dt: base_params.dt / num_substeps as Real,
                 multibody_roots: 0..0,
                 multibody_dofs: 0..0,
+                separate: false,
             });
         }
         let num_solver_iterations = base_params.num_solver_iterations + max_extra;

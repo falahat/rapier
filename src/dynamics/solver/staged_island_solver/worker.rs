@@ -19,6 +19,8 @@ use crate::math::Real;
 use parry::math::SIMD_WIDTH;
 
 use super::solve::solve_pass;
+#[cfg(feature = "parallel-groups")]
+use super::sync::StageSync;
 use super::{BODY_BATCH, GenericGroups, SharedCtx, chunk_at, stage_batch};
 
 /// Per-full-step angular rotation cap (0.25π ≈ 45°): bodies without
@@ -195,15 +197,6 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
      * lower-cadence groups see higher-cadence bodies at end-of-step poses; every worker walks
      * the identical group/substep/stage sequence, keeping the `StageSync` ordinals in lockstep.
      */
-    // Whether any island body has gyroscopic forces enabled. Set by the body-copy
-    // stage above and published by its barrier, so every worker reads the same
-    // value; gyro-free islands (the common case) skip the per-substep pass.
-    #[cfg(feature = "dim3")]
-    let has_gyroscopic = unsafe { &*ctx.any_gyroscopic }.load(Ordering::Relaxed);
-    // Whether any contact constraint captured a restitution seed, published by the
-    // constraint-generation barrier so every worker agrees. Bounce-free steps (the common
-    // case) skip the end-of-step restitution stages entirely.
-    let has_bouncy = unsafe { &*ctx.any_bouncy }.load(Ordering::Relaxed);
     let has_soft = !unsafe { &*ctx.soft_constraints }.is_empty();
     // Soft bodies solved by the FEM path: their implicit elastic step is one stage per substep,
     // and their pass stages live in `solve_pass`. Read-only during the solve, so every worker
@@ -235,611 +228,7 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
         stage = sync.sync(stage, stage_work);
     }
 
-    for (group_index, group) in ctx.groups.iter().enumerate() {
-        // This group's substep parameters: identical to `base_params` except
-        // for the substep dt. Everything dt-derived downstream (soft erp/cfm,
-        // rhs, speculative terms, integration) recomputes from this copy.
-        let mut gparams = *ctx.base_params;
-        gparams.dt = group.dt;
-        let params = &gparams;
-        let num_substeps = group.num_substeps;
-        // This group's claim domains; single-group they span everything, except `group_bodies`
-        // (island slots only — the omitted padding tail slots hold zero velocities and
-        // increments, so skipping them is behavior-preserving).
-        let group_bodies = group.bodies.clone();
-        // The per-slot stages (velocity increments, integration) cover the group's rigid slots
-        // then its soft-body particle slots, through one virtual index range.
-        let group_soft_slots = group.soft_slots.clone();
-        let num_group_bodies = group_bodies.len() + group_soft_slots.len();
-        let group_slots = 0..num_group_bodies;
-        let slot_of = |i: usize| -> usize {
-            if i < group_bodies.len() {
-                group_bodies.start + i
-            } else {
-                group_soft_slots.start + (i - group_bodies.len())
-            }
-        };
-        let num_joint_chunks = group.joint_chunks.len();
-        let joint_builders = group.joint_builders.clone();
-        // Update-stage virtual claim domain: this group's contact chunks,
-        // then its SIMD joint chunks, then its scalar joint builders.
-        let group_chunks_len = group.chunks.len();
-        let all_updates = 0..group_chunks_len + num_joint_chunks + joint_builders.len();
-
-        for substep_id in 0..num_substeps {
-            let is_last_substep = substep_id == num_substeps - 1;
-            let solved_dt = substep_id as Real * params.dt;
-
-            /*
-             * Stage: apply velocity increments (parallel over claimed body slots).
-             * Worker 0 also applies the generic (multibody) increments.
-             */
-            {
-                // +1: worker 0's generic increments.
-                let stage_work = num_group_bodies + 1;
-                let mut done = 0;
-                while let Some(claimed) = sync.claim(stage, &group_slots, BODY_BATCH, worker_id) {
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    let claimed_len = claimed.len();
-                    for i in claimed {
-                        let i = slot_of(i);
-                        let incr = vs.solver_vels_increment[i];
-                        {
-                            let vels = &mut vs.solver_bodies.vels[i];
-                            vels.linear += incr.linear;
-                            vels.angular += incr.angular;
-                        }
-
-                        // Per-substep gyroscopic correction (applied every substep
-                        // to keep long, skinny bodies stable), using the
-                        // orientation integrated by the previous substep.
-                        #[cfg(feature = "dim3")]
-                        if has_gyroscopic {
-                            let gyro = vs.solver_gyro[i];
-                            if gyro.enabled {
-                                // World-space principal axes = body rotation ∘ principal frame.
-                                let principal_axes =
-                                    vs.solver_bodies.poses[i].rotation * gyro.principal_frame;
-                                let angular = vs.solver_bodies.vels[i].angular;
-                                vs.solver_bodies.vels[i].angular = gyroscopic_corrected_angvel(
-                                    angular,
-                                    principal_axes,
-                                    gyro.principal_inertia,
-                                    gyro.inv_principal_inertia,
-                                    params.dt,
-                                );
-                            }
-                        }
-                    }
-                    done += claimed_len;
-                }
-                // One completion flush per worker per stage: per-batch RMWs on the
-                // shared counter measurably throttle scalar builds (4x the chunks).
-                sync.complete(stage, done, stage_work);
-                if worker_id == 0 {
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    let dofs = group.multibody_dofs.clone();
-                    let mut vels = vs.generic_solver_vels.rows_mut(dofs.start, dofs.len());
-                    vels += &vs
-                        .generic_solver_vels_increment
-                        .rows(dofs.start, dofs.len());
-                    sync.complete(stage, 1, stage_work);
-                }
-                stage = sync.sync(stage, stage_work);
-            }
-
-            /*
-             * Stage: the FEM soft bodies' implicit elastic step (parallel over the group's FEM
-             * bodies): assemble `A = M + h D + h² K` and solve `A Δv = h f - (A - M) v`. One body
-             * per claim; nothing else touches its system or particle slots during this stage.
-             */
-            #[cfg(feature = "fem")]
-            if has_fem {
-                let soft_fem = unsafe { &*ctx.soft_fem };
-                let fem_bodies = soft_fem.group(group_index);
-                let stage_work = fem_bodies.len();
-                let mut done = 0;
-                while let Some(claimed) = sync.claim(stage, &fem_bodies, 1, worker_id) {
-                    let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
-                    let claimed_len = claimed.len();
-                    for index in claimed {
-                        // SAFETY: one worker per claimed index; a body writes only its own
-                        // particles (soft bodies share no particle).
-                        unsafe {
-                            soft_fem.predict(index, solver_bodies, &params.soft_bodies.fem);
-                        }
-                    }
-                    done += claimed_len;
-                }
-                sync.complete(stage, done, stage_work);
-                stage = sync.sync(stage, stage_work);
-            }
-
-            /*
-             * Stage: update constraints from builders (parallel; contact chunks first, then
-             * scalar joint builders — each writes only its own constraint slot/rows).
-             * Worker 0 also updates the generic joint and generic contact constraints.
-             */
-            {
-                let multibodies = unsafe { &*ctx.multibodies };
-                // NOTE: when warm-starting is enabled (the common case), the contact
-                //       constraint updates are fused into the warmstart stage below so
-                //       each constraint is only swept once per substep.
-                let fused_contact_update = params.warmstart_coefficient != 0.0;
-                let update_domain = if fused_contact_update {
-                    group_chunks_len..all_updates.end
-                } else {
-                    all_updates.clone()
-                };
-                let stage_work = update_domain.len() + 1;
-                let mut done = 0;
-                while let Some(claimed) = sync.claim(
-                    stage,
-                    &update_domain,
-                    stage_batch(update_domain.end - update_domain.start, sync.num_workers),
-                    worker_id,
-                ) {
-                    let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
-                    let claimed_len = claimed.len();
-                    for idx in claimed {
-                        if idx >= group_chunks_len + num_joint_chunks {
-                            // SAFETY: each builder is claimed by exactly one worker per
-                            // stage and only writes itself (substep-0 GS recording) and
-                            // its own constraint rows.
-                            let joints = unsafe { &mut *ctx.joint_constraints };
-                            let builder = unsafe {
-                                &mut *joints.velocity_constraints_builder.as_mut_ptr().add(
-                                    joint_builders.start
-                                        + (idx - group_chunks_len - num_joint_chunks),
-                                )
-                            };
-                            let warmstart_joints = params
-                                .warmstart_joints
-                                .then_some(params.warmstart_coefficient);
-                            builder.update(
-                                params,
-                                substep_id,
-                                warmstart_joints,
-                                solver_bodies,
-                                &mut joints.velocity_constraints,
-                            );
-                            continue;
-                        }
-                        if idx >= group_chunks_len {
-                            // SIMD joint chunk of this group.
-                            // SAFETY: same as the scalar builders.
-                            let joints = unsafe { &mut *ctx.joint_constraints };
-                            let builder = unsafe {
-                                &mut *joints
-                                    .simd_velocity_constraints_builder
-                                    .as_mut_ptr()
-                                    .add(group.joint_chunks.start + (idx - group_chunks_len))
-                            };
-                            let warmstart_joints = params
-                                .warmstart_joints
-                                .then_some(params.warmstart_coefficient);
-                            builder.update(
-                                params,
-                                substep_id,
-                                warmstart_joints,
-                                solver_bodies,
-                                &mut joints.simd_velocity_constraints,
-                            );
-                            continue;
-                        }
-
-                        let chunk_id = group.chunks.start + idx;
-                        #[cfg(feature = "dim3")]
-                        if ctx.use_twist {
-                            let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
-                            builder.update(params, solved_dt, solver_bodies, multibodies, unsafe {
-                                &mut *ctx.twist_constraints.add(chunk_id)
-                            });
-                        }
-                        if !ctx.use_twist {
-                            let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
-                            builder.update(params, solved_dt, solver_bodies, multibodies, unsafe {
-                                &mut *ctx.coulomb_constraints.add(chunk_id)
-                            });
-                        }
-                    }
-                    done += claimed_len;
-                }
-                // One completion flush per worker per stage: per-batch RMWs on the
-                // shared counter measurably throttle scalar builds (4x the chunks).
-                sync.complete(stage, done, stage_work);
-
-                if worker_id == 0 {
-                    // This group's generic (multibody) constraints.
-                    let joints = unsafe { &mut *ctx.joint_constraints };
-                    let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
-                    let JointConstraintsSet {
-                        generic_velocity_constraints_builder,
-                        generic_jacobians,
-                        generic_velocity_constraints,
-                        ..
-                    } = joints;
-                    let builder_groups = &ctx.generic_groups.joint_builders;
-                    for (i, builder) in generic_velocity_constraints_builder.iter_mut().enumerate()
-                    {
-                        if !GenericGroups::holds(builder_groups, i, group_index) {
-                            continue;
-                        }
-                        match builder {
-                            GenericJointConstraintBuilder::External(b) => b.update(
-                                params,
-                                multibodies,
-                                solver_bodies,
-                                generic_jacobians,
-                                generic_velocity_constraints,
-                            ),
-                            GenericJointConstraintBuilder::Internal(b) => b.update(
-                                params,
-                                multibodies,
-                                generic_jacobians,
-                                generic_velocity_constraints,
-                            ),
-                            GenericJointConstraintBuilder::Empty => {}
-                        }
-                    }
-
-                    if !fused_contact_update {
-                        let contacts = unsafe { &mut *ctx.contact_constraints };
-                        let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
-                        for (i, (builder, constraint)) in contacts
-                            .generic_velocity_constraints_builder
-                            .iter()
-                            .zip(contacts.generic_velocity_constraints.iter_mut())
-                            .enumerate()
-                        {
-                            if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
-                                continue;
-                            }
-                            builder.update(
-                                params,
-                                solved_dt,
-                                solver_bodies,
-                                multibodies,
-                                constraint,
-                                &mut contacts.generic_jacobians,
-                            );
-                        }
-                    }
-                    sync.complete(stage, 1, stage_work);
-                }
-                stage = sync.sync(stage, stage_work);
-            }
-
-            /*
-             * Stages: warmstart, color by color (parallel within a color: constraints of a
-             * same color write disjoint solver bodies).
-             */
-            if params.warmstart_coefficient != 0.0 {
-                let multibodies = unsafe { &*ctx.multibodies };
-                for (_, color) in &ctx.color_ranges[group.colors.clone()] {
-                    let mut done = 0;
-                    while let Some(claimed) = sync.claim(
-                        stage,
-                        color,
-                        stage_batch(color.end - color.start, sync.num_workers),
-                        worker_id,
-                    ) {
-                        let claimed_len = claimed.len();
-                        for chunk_id in claimed {
-                            let solver_bodies =
-                                unsafe { &mut (*ctx.velocity_solver).solver_bodies };
-                            // Fused per-substep constraint update + warmstart: one sweep
-                            // over the constraint memory instead of two.
-                            #[cfg(feature = "dim3")]
-                            if ctx.use_twist {
-                                let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
-                                let constraint =
-                                    unsafe { &mut *ctx.twist_constraints.add(chunk_id) };
-                                builder.update(
-                                    params,
-                                    solved_dt,
-                                    solver_bodies,
-                                    multibodies,
-                                    constraint,
-                                );
-                                constraint.warmstart(solver_bodies);
-                            }
-                            if !ctx.use_twist {
-                                let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
-                                let constraint =
-                                    unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) };
-                                builder.update(
-                                    params,
-                                    solved_dt,
-                                    solver_bodies,
-                                    multibodies,
-                                    constraint,
-                                );
-                                constraint.warmstart(solver_bodies);
-                            }
-                        }
-                        done += claimed_len;
-                    }
-                    // One completion flush per worker per stage: per-batch RMWs on the
-                    // shared counter measurably throttle scalar builds (4x the chunks).
-                    sync.complete(stage, done, color.len());
-                    stage = sync.sync(stage, color.len());
-                }
-
-                // Overflow + generic (multibody) contacts, exclusively on worker 0
-                // (fused update + warmstart, like the colored chunks above).
-                if worker_id == 0 {
-                    for chunk_id in group.overflow.clone() {
-                        let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
-                        #[cfg(feature = "dim3")]
-                        if ctx.use_twist {
-                            let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
-                            let constraint = unsafe { &mut *ctx.twist_constraints.add(chunk_id) };
-                            builder.update(
-                                params,
-                                solved_dt,
-                                solver_bodies,
-                                multibodies,
-                                constraint,
-                            );
-                            constraint.warmstart(solver_bodies);
-                        }
-                        if !ctx.use_twist {
-                            let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
-                            let constraint = unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) };
-                            builder.update(
-                                params,
-                                solved_dt,
-                                solver_bodies,
-                                multibodies,
-                                constraint,
-                            );
-                            constraint.warmstart(solver_bodies);
-                        }
-                    }
-
-                    let contacts = unsafe { &mut *ctx.contact_constraints };
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    for (i, (builder, c)) in contacts
-                        .generic_velocity_constraints_builder
-                        .iter()
-                        .zip(contacts.generic_velocity_constraints.iter_mut())
-                        .enumerate()
-                    {
-                        if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
-                            continue;
-                        }
-                        builder.update(
-                            params,
-                            solved_dt,
-                            &vs.solver_bodies,
-                            multibodies,
-                            c,
-                            &mut contacts.generic_jacobians,
-                        );
-                        c.warmstart(
-                            &contacts.generic_jacobians,
-                            &mut vs.solver_bodies,
-                            &mut vs.generic_solver_vels,
-                        );
-                    }
-                    sync.complete(stage, 1, 1);
-                }
-                stage = sync.sync(stage, 1);
-            }
-
-            /*
-             * Stages: solve with bias. The group's count includes the extra iterations its bodies
-             * request (`RigidBody::additional_pgs_iterations`, 3 by default for soft bodies), so
-             * the substep's constraints converge against each other at the same positions.
-             */
-            for pgs_iter in 0..group.num_pgs_iterations {
-                // Joint warm-starting is fused into the first biased pass: each claimed joint
-                // applies its warm impulse right before being solved. Soft-body constraints do
-                // the same and update their geometry on the first iteration of the pass.
-                let warmstart_joints = params.warmstart_joints && pgs_iter == 0;
-                let soft_warmstart = (pgs_iter == 0 && params.warmstart_coefficient != 0.0)
-                    .then_some(params.warmstart_coefficient);
-                stage = unsafe {
-                    solve_pass(
-                        ctx,
-                        group_index,
-                        worker_id,
-                        stage,
-                        false,
-                        warmstart_joints,
-                        pgs_iter == 0,
-                        soft_warmstart,
-                        params,
-                        solved_dt,
-                    )
-                };
-            }
-
-            /*
-             * Stage: integrate positions (parallel over claimed body slots).
-             * Worker 0 also integrates the multibodies (sole accessor of `bodies` and
-             * `multibodies` during this stage).
-             */
-            {
-                // Per-substep speed cap. `max_ang` ties to the *full-step* inv_dt
-                // so per-step rotation stays under `MAX_ROTATION` regardless of substep count;
-                // clamped in place on the solver body so the cap persists into later substeps
-                // and the final velocity writeback.
-                let base_params = ctx.base_params;
-                let max_lin = base_params.max_linear_velocity();
-                let max_ang = MAX_ROTATION * base_params.inv_dt();
-
-                let mut done = 0;
-                while let Some(claimed) = sync.claim(stage, &group_slots, BODY_BATCH, worker_id) {
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    let claimed_len = claimed.len();
-                    for i in claimed {
-                        let i = slot_of(i);
-                        {
-                            let vel = &mut vs.solver_bodies.vels[i];
-                            if max_lin != Real::MAX {
-                                let n = vel.linear.length();
-                                if n > max_lin {
-                                    vel.linear *= max_lin / n;
-                                }
-                            }
-                            if vs.solver_bodies.flags[i] & SOLVER_BODY_ALLOW_FAST_ROTATION == 0 {
-                                #[cfg(feature = "dim2")]
-                                if vel.angular.abs() > max_ang {
-                                    vel.angular = vel.angular.signum() * max_ang;
-                                }
-                                #[cfg(feature = "dim3")]
-                                {
-                                    let n = vel.angular.length();
-                                    if n > max_ang {
-                                        vel.angular *= max_ang / n;
-                                    }
-                                }
-                            }
-                        }
-
-                        let vels = vs.solver_bodies.vels[i];
-                        let pose = &mut vs.solver_bodies.poses[i];
-                        let new_vels = RigidBodyVelocity {
-                            linvel: vels.linear,
-                            angvel: vels.angular,
-                        };
-                        new_vels.integrate_linearized(
-                            params.dt,
-                            &mut pose.translation,
-                            &mut pose.rotation,
-                        );
-                    }
-                    done += claimed_len;
-                }
-                // One completion flush per worker per stage: per-batch RMWs on the
-                // shared counter measurably throttle scalar builds (4x the chunks).
-                sync.complete(stage, done, num_group_bodies + 1);
-
-                if worker_id == 0 {
-                    let vs = unsafe { &mut *ctx.velocity_solver };
-                    let bodies = unsafe { &mut *ctx.bodies };
-                    let multibodies = unsafe { &mut *ctx.multibodies };
-                    vs.integrate_multibody_positions(
-                        params,
-                        group.multibody_roots.clone(),
-                        is_last_substep,
-                        bodies,
-                        multibodies,
-                    );
-                    sync.complete(stage, 1, num_group_bodies + 1);
-                }
-                stage = sync.sync(stage, num_group_bodies + 1);
-            }
-
-            /*
-             * Stages: solve without bias.
-             */
-            for stab_iter in 0..params.num_internal_stabilization_iterations {
-                stage = unsafe {
-                    solve_pass(
-                        ctx,
-                        group_index,
-                        worker_id,
-                        stage,
-                        true,
-                        false,
-                        stab_iter == 0,
-                        None,
-                        params,
-                        solved_dt + params.dt,
-                    )
-                };
-            }
-        }
-
-        /*
-         * Stages: end-of-step restitution, color by color (box2d-style). Applied ONCE after
-         * all substeps, gated on the point having applied an impulse: inside the substep rhs
-         * the speculative `dist * inv_dt` slack would truncate the bounce.
-         */
-        if has_bouncy {
-            for (_, color) in &ctx.color_ranges[group.colors.clone()] {
-                let mut done = 0;
-                while let Some(claimed) = sync.claim(
-                    stage,
-                    color,
-                    stage_batch(color.end - color.start, sync.num_workers),
-                    worker_id,
-                ) {
-                    let claimed_len = claimed.len();
-                    for chunk_id in claimed {
-                        // SAFETY: constraints of a same color touch pairwise-disjoint bodies.
-                        let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
-                        #[cfg(feature = "dim3")]
-                        if ctx.use_twist {
-                            let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
-                            builder.apply_restitution(
-                                unsafe { &mut *ctx.twist_constraints.add(chunk_id) },
-                                solver_bodies,
-                            );
-                        }
-                        if !ctx.use_twist {
-                            let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
-                            builder.apply_restitution(
-                                unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) },
-                                solver_bodies,
-                            );
-                        }
-                    }
-                    done += claimed_len;
-                }
-                // One completion flush per worker per stage (see the warmstart stages).
-                sync.complete(stage, done, color.len());
-                stage = sync.sync(stage, color.len());
-            }
-
-            // Overflow + generic (multibody) contacts, exclusively on worker 0.
-            if worker_id == 0 {
-                for chunk_id in group.overflow.clone() {
-                    let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
-                    #[cfg(feature = "dim3")]
-                    if ctx.use_twist {
-                        let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
-                        builder.apply_restitution(
-                            unsafe { &mut *ctx.twist_constraints.add(chunk_id) },
-                            solver_bodies,
-                        );
-                    }
-                    if !ctx.use_twist {
-                        let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
-                        builder.apply_restitution(
-                            unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) },
-                            solver_bodies,
-                        );
-                    }
-                }
-
-                // This group's generic (multibody) contacts.
-                let contacts = unsafe { &mut *ctx.contact_constraints };
-                let vs = unsafe { &mut *ctx.velocity_solver };
-                for (i, (builder, c)) in contacts
-                    .generic_velocity_constraints_builder
-                    .iter()
-                    .zip(contacts.generic_velocity_constraints.iter_mut())
-                    .enumerate()
-                {
-                    if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
-                        continue;
-                    }
-                    builder.apply_restitution(
-                        c,
-                        &contacts.generic_jacobians,
-                        &mut vs.solver_bodies,
-                        &mut vs.generic_solver_vels,
-                    );
-                }
-                sync.complete(stage, 1, 1);
-            }
-            stage = sync.sync(stage, 1);
-        }
-    }
+    stage = unsafe { run_groups(ctx, worker_id, stage) };
 
     /*
      * Stage: write impulses back to the manifolds (parallel; each chunk writes only its own
@@ -1071,4 +460,663 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
         // the caller's scope join is the final synchronization point.
         let _ = stage;
     }
+}
+
+/// Every group's substeps, from stage `stage`, returning the stage after the last: one group
+/// after another, or, with `parallel-groups` and a single worker, the separate groups (see
+/// `GroupLayout::separate`) side by side on rayon's pool, each staged through a sync of its
+/// own, while this thread solves the others in order.
+unsafe fn run_groups(ctx: &SharedCtx, worker_id: usize, mut stage: usize) -> usize {
+    let side_by_side = cfg!(feature = "parallel-groups")
+        && ctx.sync.num_workers == 1
+        && (ctx.groups.iter()).filter(|g| g.separate).nth(1).is_some();
+    if side_by_side {
+        #[cfg(feature = "parallel-groups")]
+        {
+            let mut kept = None;
+            rayon::in_place_scope(|scope| {
+                for (group_index, group) in ctx.groups.iter().enumerate() {
+                    if !group.separate {
+                        continue;
+                    }
+                    if kept.is_none() {
+                        kept = Some(group_index);
+                        continue;
+                    }
+                    scope.spawn(move |_| {
+                        let sync = StageSync::new(1);
+                        let ctx = SharedCtx {
+                            sync: &sync,
+                            ..*ctx
+                        };
+                        // SAFETY: a separate group's bodies, degrees of freedom and constraints
+                        // are its own; it reads only the fixed and sleeping bodies besides.
+                        unsafe { run_group(&ctx, 0, group_index, 0) };
+                    });
+                }
+                for group_index in 0..ctx.groups.len() {
+                    if !ctx.groups[group_index].separate || kept == Some(group_index) {
+                        stage = unsafe { run_group(ctx, worker_id, group_index, stage) };
+                    }
+                }
+            });
+            return stage;
+        }
+    }
+    for group_index in 0..ctx.groups.len() {
+        stage = unsafe { run_group(ctx, worker_id, group_index, stage) };
+    }
+    stage
+}
+
+/// Group `group_index`'s substeps and its end-of-step restitution, staged through `ctx.sync`
+/// from stage `stage`; returns the stage after its last. See [`SharedCtx`] for the safety
+/// contract.
+unsafe fn run_group(
+    ctx: &SharedCtx,
+    worker_id: usize,
+    group_index: usize,
+    mut stage: usize,
+) -> usize {
+    let sync = ctx.sync;
+    let group = &ctx.groups[group_index];
+    // Whether any island body has gyroscopic forces enabled. Set by the body-copy stage of
+    // [`run_worker`] and published by its barrier, so every worker reads the same value;
+    // gyro-free islands (the common case) skip the per-substep pass.
+    #[cfg(feature = "dim3")]
+    let has_gyroscopic = unsafe { &*ctx.any_gyroscopic }.load(Ordering::Relaxed);
+    // Whether any contact constraint captured a restitution seed, published by the
+    // constraint-generation barrier of [`run_worker`] so every worker agrees. Bounce-free
+    // steps (the common case) skip the end-of-step restitution stages entirely.
+    let has_bouncy = unsafe { &*ctx.any_bouncy }.load(Ordering::Relaxed);
+    // Soft bodies solved by the FEM path (see [`run_worker`]).
+    #[cfg(feature = "fem")]
+    let has_fem = !unsafe { &*ctx.soft_fem }.is_empty();
+    // This group's substep parameters: identical to `base_params` except
+    // for the substep dt. Everything dt-derived downstream (soft erp/cfm,
+    // rhs, speculative terms, integration) recomputes from this copy.
+    let mut gparams = *ctx.base_params;
+    gparams.dt = group.dt;
+    let params = &gparams;
+    let num_substeps = group.num_substeps;
+    // This group's claim domains; single-group they span everything, except `group_bodies`
+    // (island slots only — the omitted padding tail slots hold zero velocities and
+    // increments, so skipping them is behavior-preserving).
+    let group_bodies = group.bodies.clone();
+    // The per-slot stages (velocity increments, integration) cover the group's rigid slots
+    // then its soft-body particle slots, through one virtual index range.
+    let group_soft_slots = group.soft_slots.clone();
+    let num_group_bodies = group_bodies.len() + group_soft_slots.len();
+    let group_slots = 0..num_group_bodies;
+    let slot_of = |i: usize| -> usize {
+        if i < group_bodies.len() {
+            group_bodies.start + i
+        } else {
+            group_soft_slots.start + (i - group_bodies.len())
+        }
+    };
+    let num_joint_chunks = group.joint_chunks.len();
+    let joint_builders = group.joint_builders.clone();
+    // Update-stage virtual claim domain: this group's contact chunks,
+    // then its SIMD joint chunks, then its scalar joint builders.
+    let group_chunks_len = group.chunks.len();
+    let all_updates = 0..group_chunks_len + num_joint_chunks + joint_builders.len();
+
+    for substep_id in 0..num_substeps {
+        let is_last_substep = substep_id == num_substeps - 1;
+        let solved_dt = substep_id as Real * params.dt;
+
+        /*
+         * Stage: apply velocity increments (parallel over claimed body slots).
+         * Worker 0 also applies the generic (multibody) increments.
+         */
+        {
+            // +1: worker 0's generic increments.
+            let stage_work = num_group_bodies + 1;
+            let mut done = 0;
+            while let Some(claimed) = sync.claim(stage, &group_slots, BODY_BATCH, worker_id) {
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                let claimed_len = claimed.len();
+                for i in claimed {
+                    let i = slot_of(i);
+                    let incr = vs.solver_vels_increment[i];
+                    {
+                        let vels = &mut vs.solver_bodies.vels[i];
+                        vels.linear += incr.linear;
+                        vels.angular += incr.angular;
+                    }
+
+                    // Per-substep gyroscopic correction (applied every substep
+                    // to keep long, skinny bodies stable), using the
+                    // orientation integrated by the previous substep.
+                    #[cfg(feature = "dim3")]
+                    if has_gyroscopic {
+                        let gyro = vs.solver_gyro[i];
+                        if gyro.enabled {
+                            // World-space principal axes = body rotation ∘ principal frame.
+                            let principal_axes =
+                                vs.solver_bodies.poses[i].rotation * gyro.principal_frame;
+                            let angular = vs.solver_bodies.vels[i].angular;
+                            vs.solver_bodies.vels[i].angular = gyroscopic_corrected_angvel(
+                                angular,
+                                principal_axes,
+                                gyro.principal_inertia,
+                                gyro.inv_principal_inertia,
+                                params.dt,
+                            );
+                        }
+                    }
+                }
+                done += claimed_len;
+            }
+            // One completion flush per worker per stage: per-batch RMWs on the
+            // shared counter measurably throttle scalar builds (4x the chunks).
+            sync.complete(stage, done, stage_work);
+            if worker_id == 0 {
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                let dofs = group.multibody_dofs.clone();
+                let mut vels = vs.generic_solver_vels.rows_mut(dofs.start, dofs.len());
+                vels += &vs
+                    .generic_solver_vels_increment
+                    .rows(dofs.start, dofs.len());
+                sync.complete(stage, 1, stage_work);
+            }
+            stage = sync.sync(stage, stage_work);
+        }
+
+        /*
+         * Stage: the FEM soft bodies' implicit elastic step (parallel over the group's FEM
+         * bodies): assemble `A = M + h D + h² K` and solve `A Δv = h f - (A - M) v`. One body
+         * per claim; nothing else touches its system or particle slots during this stage.
+         */
+        #[cfg(feature = "fem")]
+        if has_fem {
+            let soft_fem = unsafe { &*ctx.soft_fem };
+            let fem_bodies = soft_fem.group(group_index);
+            let stage_work = fem_bodies.len();
+            let mut done = 0;
+            while let Some(claimed) = sync.claim(stage, &fem_bodies, 1, worker_id) {
+                let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
+                let claimed_len = claimed.len();
+                for index in claimed {
+                    // SAFETY: one worker per claimed index; a body writes only its own
+                    // particles (soft bodies share no particle).
+                    unsafe {
+                        soft_fem.predict(index, solver_bodies, &params.soft_bodies.fem);
+                    }
+                }
+                done += claimed_len;
+            }
+            sync.complete(stage, done, stage_work);
+            stage = sync.sync(stage, stage_work);
+        }
+
+        /*
+         * Stage: update constraints from builders (parallel; contact chunks first, then
+         * scalar joint builders — each writes only its own constraint slot/rows).
+         * Worker 0 also updates the generic joint and generic contact constraints.
+         */
+        {
+            let multibodies = unsafe { &*ctx.multibodies };
+            // NOTE: when warm-starting is enabled (the common case), the contact
+            //       constraint updates are fused into the warmstart stage below so
+            //       each constraint is only swept once per substep.
+            let fused_contact_update = params.warmstart_coefficient != 0.0;
+            let update_domain = if fused_contact_update {
+                group_chunks_len..all_updates.end
+            } else {
+                all_updates.clone()
+            };
+            let stage_work = update_domain.len() + 1;
+            let mut done = 0;
+            while let Some(claimed) = sync.claim(
+                stage,
+                &update_domain,
+                stage_batch(update_domain.end - update_domain.start, sync.num_workers),
+                worker_id,
+            ) {
+                let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
+                let claimed_len = claimed.len();
+                for idx in claimed {
+                    if idx >= group_chunks_len + num_joint_chunks {
+                        // SAFETY: each builder is claimed by exactly one worker per
+                        // stage and only writes itself (substep-0 GS recording) and
+                        // its own constraint rows.
+                        let joints = unsafe { &mut *ctx.joint_constraints };
+                        let builder = unsafe {
+                            &mut *joints.velocity_constraints_builder.as_mut_ptr().add(
+                                joint_builders.start + (idx - group_chunks_len - num_joint_chunks),
+                            )
+                        };
+                        let warmstart_joints = params
+                            .warmstart_joints
+                            .then_some(params.warmstart_coefficient);
+                        builder.update(
+                            params,
+                            substep_id,
+                            warmstart_joints,
+                            solver_bodies,
+                            &mut joints.velocity_constraints,
+                        );
+                        continue;
+                    }
+                    if idx >= group_chunks_len {
+                        // SIMD joint chunk of this group.
+                        // SAFETY: same as the scalar builders.
+                        let joints = unsafe { &mut *ctx.joint_constraints };
+                        let builder = unsafe {
+                            &mut *joints
+                                .simd_velocity_constraints_builder
+                                .as_mut_ptr()
+                                .add(group.joint_chunks.start + (idx - group_chunks_len))
+                        };
+                        let warmstart_joints = params
+                            .warmstart_joints
+                            .then_some(params.warmstart_coefficient);
+                        builder.update(
+                            params,
+                            substep_id,
+                            warmstart_joints,
+                            solver_bodies,
+                            &mut joints.simd_velocity_constraints,
+                        );
+                        continue;
+                    }
+
+                    let chunk_id = group.chunks.start + idx;
+                    #[cfg(feature = "dim3")]
+                    if ctx.use_twist {
+                        let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
+                        builder.update(params, solved_dt, solver_bodies, multibodies, unsafe {
+                            &mut *ctx.twist_constraints.add(chunk_id)
+                        });
+                    }
+                    if !ctx.use_twist {
+                        let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
+                        builder.update(params, solved_dt, solver_bodies, multibodies, unsafe {
+                            &mut *ctx.coulomb_constraints.add(chunk_id)
+                        });
+                    }
+                }
+                done += claimed_len;
+            }
+            // One completion flush per worker per stage: per-batch RMWs on the
+            // shared counter measurably throttle scalar builds (4x the chunks).
+            sync.complete(stage, done, stage_work);
+
+            if worker_id == 0 {
+                // This group's generic (multibody) constraints.
+                let joints = unsafe { &mut *ctx.joint_constraints };
+                let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
+                let JointConstraintsSet {
+                    generic_velocity_constraints_builder,
+                    generic_jacobians,
+                    generic_velocity_constraints,
+                    ..
+                } = joints;
+                let builder_groups = &ctx.generic_groups.joint_builders;
+                for (i, builder) in generic_velocity_constraints_builder.iter_mut().enumerate() {
+                    if !GenericGroups::holds(builder_groups, i, group_index) {
+                        continue;
+                    }
+                    match builder {
+                        GenericJointConstraintBuilder::External(b) => b.update(
+                            params,
+                            multibodies,
+                            solver_bodies,
+                            generic_jacobians,
+                            generic_velocity_constraints,
+                        ),
+                        GenericJointConstraintBuilder::Internal(b) => b.update(
+                            params,
+                            multibodies,
+                            generic_jacobians,
+                            generic_velocity_constraints,
+                        ),
+                        GenericJointConstraintBuilder::Empty => {}
+                    }
+                }
+
+                if !fused_contact_update {
+                    let contacts = unsafe { &mut *ctx.contact_constraints };
+                    let solver_bodies = unsafe { &(*ctx.velocity_solver).solver_bodies };
+                    for (i, (builder, constraint)) in contacts
+                        .generic_velocity_constraints_builder
+                        .iter()
+                        .zip(contacts.generic_velocity_constraints.iter_mut())
+                        .enumerate()
+                    {
+                        if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                            continue;
+                        }
+                        builder.update(
+                            params,
+                            solved_dt,
+                            solver_bodies,
+                            multibodies,
+                            constraint,
+                            &mut contacts.generic_jacobians,
+                        );
+                    }
+                }
+                sync.complete(stage, 1, stage_work);
+            }
+            stage = sync.sync(stage, stage_work);
+        }
+
+        /*
+         * Stages: warmstart, color by color (parallel within a color: constraints of a
+         * same color write disjoint solver bodies).
+         */
+        if params.warmstart_coefficient != 0.0 {
+            let multibodies = unsafe { &*ctx.multibodies };
+            for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+                let mut done = 0;
+                while let Some(claimed) = sync.claim(
+                    stage,
+                    color,
+                    stage_batch(color.end - color.start, sync.num_workers),
+                    worker_id,
+                ) {
+                    let claimed_len = claimed.len();
+                    for chunk_id in claimed {
+                        let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
+                        // Fused per-substep constraint update + warmstart: one sweep
+                        // over the constraint memory instead of two.
+                        #[cfg(feature = "dim3")]
+                        if ctx.use_twist {
+                            let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
+                            let constraint = unsafe { &mut *ctx.twist_constraints.add(chunk_id) };
+                            builder.update(
+                                params,
+                                solved_dt,
+                                solver_bodies,
+                                multibodies,
+                                constraint,
+                            );
+                            constraint.warmstart(solver_bodies);
+                        }
+                        if !ctx.use_twist {
+                            let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
+                            let constraint = unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) };
+                            builder.update(
+                                params,
+                                solved_dt,
+                                solver_bodies,
+                                multibodies,
+                                constraint,
+                            );
+                            constraint.warmstart(solver_bodies);
+                        }
+                    }
+                    done += claimed_len;
+                }
+                // One completion flush per worker per stage: per-batch RMWs on the
+                // shared counter measurably throttle scalar builds (4x the chunks).
+                sync.complete(stage, done, color.len());
+                stage = sync.sync(stage, color.len());
+            }
+
+            // Overflow + generic (multibody) contacts, exclusively on worker 0
+            // (fused update + warmstart, like the colored chunks above).
+            if worker_id == 0 {
+                for chunk_id in group.overflow.clone() {
+                    let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
+                    #[cfg(feature = "dim3")]
+                    if ctx.use_twist {
+                        let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
+                        let constraint = unsafe { &mut *ctx.twist_constraints.add(chunk_id) };
+                        builder.update(params, solved_dt, solver_bodies, multibodies, constraint);
+                        constraint.warmstart(solver_bodies);
+                    }
+                    if !ctx.use_twist {
+                        let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
+                        let constraint = unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) };
+                        builder.update(params, solved_dt, solver_bodies, multibodies, constraint);
+                        constraint.warmstart(solver_bodies);
+                    }
+                }
+
+                let contacts = unsafe { &mut *ctx.contact_constraints };
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                for (i, (builder, c)) in contacts
+                    .generic_velocity_constraints_builder
+                    .iter()
+                    .zip(contacts.generic_velocity_constraints.iter_mut())
+                    .enumerate()
+                {
+                    if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                        continue;
+                    }
+                    builder.update(
+                        params,
+                        solved_dt,
+                        &vs.solver_bodies,
+                        multibodies,
+                        c,
+                        &mut contacts.generic_jacobians,
+                    );
+                    c.warmstart(
+                        &contacts.generic_jacobians,
+                        &mut vs.solver_bodies,
+                        &mut vs.generic_solver_vels,
+                    );
+                }
+                sync.complete(stage, 1, 1);
+            }
+            stage = sync.sync(stage, 1);
+        }
+
+        /*
+         * Stages: solve with bias. The group's count includes the extra iterations its bodies
+         * request (`RigidBody::additional_pgs_iterations`, 3 by default for soft bodies), so
+         * the substep's constraints converge against each other at the same positions.
+         */
+        for pgs_iter in 0..group.num_pgs_iterations {
+            // Joint warm-starting is fused into the first biased pass: each claimed joint
+            // applies its warm impulse right before being solved. Soft-body constraints do
+            // the same and update their geometry on the first iteration of the pass.
+            let warmstart_joints = params.warmstart_joints && pgs_iter == 0;
+            let soft_warmstart = (pgs_iter == 0 && params.warmstart_coefficient != 0.0)
+                .then_some(params.warmstart_coefficient);
+            stage = unsafe {
+                solve_pass(
+                    ctx,
+                    group_index,
+                    worker_id,
+                    stage,
+                    false,
+                    warmstart_joints,
+                    pgs_iter == 0,
+                    soft_warmstart,
+                    params,
+                    solved_dt,
+                )
+            };
+        }
+
+        /*
+         * Stage: integrate positions (parallel over claimed body slots).
+         * Worker 0 also integrates the multibodies (sole accessor of `bodies` and
+         * `multibodies` during this stage).
+         */
+        {
+            // Per-substep speed cap. `max_ang` ties to the *full-step* inv_dt
+            // so per-step rotation stays under `MAX_ROTATION` regardless of substep count;
+            // clamped in place on the solver body so the cap persists into later substeps
+            // and the final velocity writeback.
+            let base_params = ctx.base_params;
+            let max_lin = base_params.max_linear_velocity();
+            let max_ang = MAX_ROTATION * base_params.inv_dt();
+
+            let mut done = 0;
+            while let Some(claimed) = sync.claim(stage, &group_slots, BODY_BATCH, worker_id) {
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                let claimed_len = claimed.len();
+                for i in claimed {
+                    let i = slot_of(i);
+                    {
+                        let vel = &mut vs.solver_bodies.vels[i];
+                        if max_lin != Real::MAX {
+                            let n = vel.linear.length();
+                            if n > max_lin {
+                                vel.linear *= max_lin / n;
+                            }
+                        }
+                        if vs.solver_bodies.flags[i] & SOLVER_BODY_ALLOW_FAST_ROTATION == 0 {
+                            #[cfg(feature = "dim2")]
+                            if vel.angular.abs() > max_ang {
+                                vel.angular = vel.angular.signum() * max_ang;
+                            }
+                            #[cfg(feature = "dim3")]
+                            {
+                                let n = vel.angular.length();
+                                if n > max_ang {
+                                    vel.angular *= max_ang / n;
+                                }
+                            }
+                        }
+                    }
+
+                    let vels = vs.solver_bodies.vels[i];
+                    let pose = &mut vs.solver_bodies.poses[i];
+                    let new_vels = RigidBodyVelocity {
+                        linvel: vels.linear,
+                        angvel: vels.angular,
+                    };
+                    new_vels.integrate_linearized(
+                        params.dt,
+                        &mut pose.translation,
+                        &mut pose.rotation,
+                    );
+                }
+                done += claimed_len;
+            }
+            // One completion flush per worker per stage: per-batch RMWs on the
+            // shared counter measurably throttle scalar builds (4x the chunks).
+            sync.complete(stage, done, num_group_bodies + 1);
+
+            if worker_id == 0 {
+                let vs = unsafe { &mut *ctx.velocity_solver };
+                let bodies = unsafe { &mut *ctx.bodies };
+                let multibodies = unsafe { &mut *ctx.multibodies };
+                vs.integrate_multibody_positions(
+                    params,
+                    group.multibody_roots.clone(),
+                    is_last_substep,
+                    bodies,
+                    multibodies,
+                );
+                sync.complete(stage, 1, num_group_bodies + 1);
+            }
+            stage = sync.sync(stage, num_group_bodies + 1);
+        }
+
+        /*
+         * Stages: solve without bias.
+         */
+        for stab_iter in 0..params.num_internal_stabilization_iterations {
+            stage = unsafe {
+                solve_pass(
+                    ctx,
+                    group_index,
+                    worker_id,
+                    stage,
+                    true,
+                    false,
+                    stab_iter == 0,
+                    None,
+                    params,
+                    solved_dt + params.dt,
+                )
+            };
+        }
+    }
+
+    /*
+     * Stages: end-of-step restitution, color by color (box2d-style). Applied ONCE after
+     * all substeps, gated on the point having applied an impulse: inside the substep rhs
+     * the speculative `dist * inv_dt` slack would truncate the bounce.
+     */
+    if has_bouncy {
+        for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+            let mut done = 0;
+            while let Some(claimed) = sync.claim(
+                stage,
+                color,
+                stage_batch(color.end - color.start, sync.num_workers),
+                worker_id,
+            ) {
+                let claimed_len = claimed.len();
+                for chunk_id in claimed {
+                    // SAFETY: constraints of a same color touch pairwise-disjoint bodies.
+                    let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
+                    #[cfg(feature = "dim3")]
+                    if ctx.use_twist {
+                        let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
+                        builder.apply_restitution(
+                            unsafe { &mut *ctx.twist_constraints.add(chunk_id) },
+                            solver_bodies,
+                        );
+                    }
+                    if !ctx.use_twist {
+                        let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
+                        builder.apply_restitution(
+                            unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) },
+                            solver_bodies,
+                        );
+                    }
+                }
+                done += claimed_len;
+            }
+            // One completion flush per worker per stage (see the warmstart stages).
+            sync.complete(stage, done, color.len());
+            stage = sync.sync(stage, color.len());
+        }
+
+        // Overflow + generic (multibody) contacts, exclusively on worker 0.
+        if worker_id == 0 {
+            for chunk_id in group.overflow.clone() {
+                let solver_bodies = unsafe { &mut (*ctx.velocity_solver).solver_bodies };
+                #[cfg(feature = "dim3")]
+                if ctx.use_twist {
+                    let builder = unsafe { &*ctx.twist_builders.add(chunk_id) };
+                    builder.apply_restitution(
+                        unsafe { &mut *ctx.twist_constraints.add(chunk_id) },
+                        solver_bodies,
+                    );
+                }
+                if !ctx.use_twist {
+                    let builder = unsafe { &*ctx.coulomb_builders.add(chunk_id) };
+                    builder.apply_restitution(
+                        unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) },
+                        solver_bodies,
+                    );
+                }
+            }
+
+            // This group's generic (multibody) contacts.
+            let contacts = unsafe { &mut *ctx.contact_constraints };
+            let vs = unsafe { &mut *ctx.velocity_solver };
+            for (i, (builder, c)) in contacts
+                .generic_velocity_constraints_builder
+                .iter()
+                .zip(contacts.generic_velocity_constraints.iter_mut())
+                .enumerate()
+            {
+                if !GenericGroups::holds(&ctx.generic_groups.contacts, i, group_index) {
+                    continue;
+                }
+                builder.apply_restitution(
+                    c,
+                    &contacts.generic_jacobians,
+                    &mut vs.solver_bodies,
+                    &mut vs.generic_solver_vels,
+                );
+            }
+            sync.complete(stage, 1, 1);
+        }
+        stage = sync.sync(stage, 1);
+    }
+    stage
 }
