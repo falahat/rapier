@@ -71,6 +71,7 @@ impl IslandManager {
         soft_bodies: &SoftBodySet,
     ) {
         self.solve_groups.clear();
+        self.touching_sets = [0; 3];
         if !any_extra {
             return;
         }
@@ -147,6 +148,24 @@ impl IslandManager {
                 }
             }
         }
+
+        // EXPERIMENT: how the awake jointed bodies split into touching sets.
+        let mut roots: Vec<u32> = multibody_joints
+            .multibodies()
+            .filter_map(|mb| mb.links().find_map(|link| slot(link.rigid_body_handle())))
+            .map(|s| ws.uf.find(s))
+            .collect();
+        roots.sort_unstable();
+        let (mut sets, mut largest, mut run) = (0, 0, 0);
+        for (i, root) in roots.iter().enumerate() {
+            if i == 0 || roots[i - 1] != *root {
+                sets += 1;
+                run = 0;
+            }
+            run += 1;
+            largest = largest.max(run);
+        }
+        self.touching_sets = [roots.len(), sets, largest];
 
         // Effective counts per body = max of each over its component; non-dynamic awake bodies
         // stay singletons with key 0, then are lifted to the highest-cadence group they touch.

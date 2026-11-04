@@ -48,12 +48,22 @@ pub struct IslandManager {
     /// The persistent islands: connected components of the touching-contact/joint
     /// graph, maintained incrementally.
     pub(crate) persistent: super::PersistentIslands,
+    /// EXPERIMENT: of the awake jointed bodies at the last solve-group update,
+    /// how many there were, how many touching sets they formed, and how many
+    /// the largest set held.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) touching_sets: [usize; 3],
 }
 
 impl IslandManager {
     /// Creates a new empty island manager.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// EXPERIMENT: see the `touching_sets` field.
+    pub fn touching_sets(&self) -> [usize; 3] {
+        self.touching_sets
     }
 
     #[inline]
