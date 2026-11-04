@@ -398,11 +398,9 @@ impl GenericContactConstraintBuilder {
         constraint: &mut GenericContactConstraint,
         jacobians: &mut DVector,
     ) {
-        // `generate` weighted the rows by the step's first mass matrix, which its
-        // first substep still solves with.
-        if solved_dt > 0.0 {
-            self.reweigh(multibodies, constraint, jacobians);
-        }
+        // EXPERIMENT: `generate` weighted the rows by the step's first mass
+        // matrix, which every substep now solves with.
+        let _ = Self::reweigh;
         // Contacts touching a fixed body use a stiffer "static" softness.
         // A world-attached side has solver-vel id `u32::MAX`; exclude multibody links, whose
         // pose comes from the multibody path rather than a solver body.

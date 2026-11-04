@@ -158,9 +158,10 @@ impl VelocitySolver {
             multibody.forward_kinematics(bodies, false);
             multibody.update_rigid_bodies_internal(bodies, !is_last_substep, true, false);
 
+            // EXPERIMENT: the next substep solves with the mass matrix the
+            // step began with, so only the free accelerations follow the pose.
             if !is_last_substep {
                 multibody.update_velocities(bodies);
-                multibody.update_mass_matrix(params.dt, bodies);
                 multibody.update_acceleration(params.dt, bodies);
 
                 let mut solver_vels_incr = self
