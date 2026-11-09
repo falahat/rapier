@@ -308,7 +308,8 @@ pub struct IntegrationParameters {
     /// (default: `true`) — a large speed-up for quasi-static scenes. Trade-offs:
     /// contact features and user-facing contact data (`dist`, is-new bits) may be stale by up to that
     /// distance, and per-step joint-based contact filtering is skipped until the pair moves.
-    /// [`crate::pipeline::ActiveHooks`] pairs are never recycled.
+    /// Pairs with filter [`crate::pipeline::ActiveHooks`] are never recycled; a pair whose only hook
+    /// modifies its solver contacts recycles them as that hook last left them.
     pub contact_recycling: bool,
     /// Maximum relative-pose drift (translation plus rotation-arc) below which a contact pair may
     /// be recycled instead of fully updated (default: `0.05`, i.e. ten times the linear slop,

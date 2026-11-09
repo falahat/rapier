@@ -115,12 +115,16 @@ pub(super) fn process_pair(
     if contact_recycle_distance > 0.0 {
         if let Some(state) = pair.rigid().and_then(|r| r.recycle_state.as_ref()) {
             // Anything beyond a position change (shape, groups, type,
-            // enabled flag, ...) requires a full update, as do pairs
-            // relying on per-step user hooks.
+            // enabled flag, ...) requires a full update, as do pairs whose
+            // filter hooks decide each step. A pair whose only hook modifies
+            // its solver contacts keeps them as that hook last left them, as
+            // it keeps the rest of its contacts.
             let recycle_safe = ColliderChanges::IN_MODIFIED_SET
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
-            let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
+            let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks)
+                .difference(ActiveHooks::MODIFY_SOLVER_CONTACTS)
+                .is_empty();
 
             if ((co1.changes | co2.changes) & !recycle_safe).is_empty() && !hooks_involved {
                 let pos12 = co1.pos.inv_mul(&co2.pos);
