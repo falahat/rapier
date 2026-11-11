@@ -430,7 +430,10 @@ impl<N: ScalarType> JointConstraintHelper<N> {
         let ang_jac2 = self.cmat2_basis.column(locked_axis).into();
 
         let rhs_wo_bias = N::zero();
-        let rhs_bias = lin_jac.gdot(self.lin_err) * erp_inv_dt;
+        // Capped as a limit's bias is: a joint pulled apart (one body clamped short by CCD
+        // while the other moves on) closes over a few steps instead of catapulting the bodies.
+        let max_bias = N::splat(_params.max_corrective_velocity());
+        let rhs_bias = (lin_jac.gdot(self.lin_err) * erp_inv_dt).simd_clamp(-max_bias, max_bias);
 
         let ii_ang_jac1 = body1.ii.transform_vector(ang_jac1);
         let ii_ang_jac2 = body2.ii.transform_vector(ang_jac2);
@@ -646,6 +649,9 @@ impl<N: ScalarType> JointConstraintHelper<N> {
         let rhs_bias = self.ang_err.imag() * erp_inv_dt;
         #[cfg(feature = "dim3")]
         let rhs_bias = self.ang_err.imag()[_locked_axis] * erp_inv_dt;
+        // Capped as `lock_linear`'s is.
+        let max_bias = N::splat(_params.max_corrective_velocity());
+        let rhs_bias = rhs_bias.simd_clamp(-max_bias, max_bias);
 
         let ii_ang_jac1 = body1.ii.transform_vector(ang_jac);
         let ii_ang_jac2 = body2.ii.transform_vector(ang_jac);

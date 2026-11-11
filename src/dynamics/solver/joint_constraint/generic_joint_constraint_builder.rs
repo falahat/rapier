@@ -515,7 +515,9 @@ impl JointConstraintHelper<Real> {
         );
 
         let erp_inv_dt = softness.erp_inv_dt(params.dt);
-        let rhs_bias = lin_jac.dot(self.lin_err) * erp_inv_dt;
+        // Capped as `JointConstraintHelper::lock_linear`'s is.
+        let max_bias = params.max_corrective_velocity();
+        let rhs_bias = (lin_jac.dot(self.lin_err) * erp_inv_dt).clamp(-max_bias, max_bias);
         c.rhs += rhs_bias;
         c
     }
@@ -665,7 +667,9 @@ impl JointConstraintHelper<Real> {
         let rhs_bias = self.ang_err.im * erp_inv_dt;
         #[cfg(feature = "dim3")]
         let rhs_bias = self.ang_err.xyz()[_locked_axis] * erp_inv_dt;
-        constraint.rhs += rhs_bias;
+        // Capped as `JointConstraintHelper::lock_linear`'s is.
+        let max_bias = params.max_corrective_velocity();
+        constraint.rhs += rhs_bias.clamp(-max_bias, max_bias);
         constraint
     }
 
